@@ -2,3 +2,5 @@
 __pycache__/
 *.faiss
 .env
+data/raw_muestra/
+data/raw/fenomeno_1/
