@@ -27,6 +27,32 @@ calidad.quality_score   # 0.0 - 1.0
 calidad.quality_label   # 'alta' / 'media' / 'baja'
 ```
 
+## Ejecución de chunking de fase 3
+
+```bash
+uv run python -m codefest_ad_astra.ingest.chunking \
+  --entrada data/processed/corpus.jsonl \
+  --salida data/processed/chunks.jsonl \
+  --errores data/processed/chunking_errors.jsonl \
+  --tokenizer-model sentence-transformers/all-MiniLM-L6-v2 \
+  --max-tokens 450 \
+  --max-words 250 \
+  --overlap-sentences 1 \
+  --on-oversize skip-document
+```
+
+El módulo `codefest_ad_astra.ingest.chunking` produce:
+- `chunk_id` secuencial por documento
+- `posicion` con orden de chunk dentro del documento
+- `texto` exacto correspondiente al slice original
+- `char_start` / `char_end` en offsets del texto de entrada
+
+Soporta cualquier valor de `formato` que haya generado la fase previa. El módulo no valida un conjunto cerrado de formatos; conserva el valor original que llega en cada documento.
+
+De igual forma, `idioma` se acepta siempre que sea una cadena de texto no vacía. El módulo no rechaza por anticipado idiomas desconocidos; conserva el valor original de la fase previa.
+
+El output es atómico: se escribe en archivos temporales y se reemplaza solo si no hay errores fatales.
+
 **Nota metodológica importante:** para PDFs largos y multipágina, `quality_score` puede aparecer más bajo de lo real. Esto es un artefacto conocido: `pdfplumber` no preserva separadores de párrafo dentro de una página, así que cada página termina como una sola línea larga, y el ratio de "líneas útiles" del validador termina midiendo aproximadamente el número de páginas, no la calidad real del texto. Si vas a filtrar documentos por `quality_score`, para PDFs conviene mirar también `characters` y `words`, no solo el score aislado.
 
 ## Qué NO vas a recibir (y por qué, con evidencia)

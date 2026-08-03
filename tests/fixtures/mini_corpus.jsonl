@@ -1,0 +1,3 @@
+{"doc_id": "doc1", "fuente": "fuente", "formato": "txt", "fenomeno": 1, "idioma": "es", "texto": "Título de sección\n\nPrimera oración. Segunda oración. Dr. Pérez llegó.\n\nOtra oración."}
+{"doc_id": "doc2", "fuente": "fuente", "formato": "html", "fenomeno": 2, "idioma": "en", "texto": "Header\n\nFirst sentence. Second sentence? Note: this is a list:\n- item one\n- item two.\n\nEnd."}
+{"doc_id": "doc3", "fuente": "fuente", "formato": "txt", "fenomeno": 3, "idioma": "pt", "texto": "Primeira frase. Segunda frase. Dr. Silva está aqui.\n\nOutro parágrafo."}
