@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import faiss
@@ -54,6 +55,15 @@ def guardar_base_vectorial(
     orden, sin IDs explícitos) -- así se cumple el requisito de la spec
     Sección 1.4/5.3 de que el orden de metadata.jsonl coincida con los IDs
     internos de FAISS.
+
+    Ambos archivos se escriben primero a rutas temporales dentro de la misma
+    carpeta y solo se mueven a su ubicación final (vía os.replace, atómico
+    en el mismo filesystem tanto en POSIX como en Windows) una vez que
+    AMBAS escrituras terminaron con éxito. Así, si el proceso muere o falla
+    la I/O a mitad de camino (disco lleno, fragmento no serializable, etc.),
+    nunca queda un index.faiss completo junto a un metadata.jsonl ausente o
+    truncado -- el escenario de "índice a medio escribir sin metadata
+    correspondiente" que la spec señala como peor que fallar directamente.
     """
     if len(fragmentos) != vectores.shape[0]:
         raise ValueError(
@@ -64,12 +74,28 @@ def guardar_base_vectorial(
     carpeta_encoder = carpeta_salida / f"encoder_{nombre_encoder}"
     carpeta_encoder.mkdir(parents=True, exist_ok=True)
 
-    indice = construir_indice(vectores)
-    faiss.write_index(indice, str(carpeta_encoder / "index.faiss"))
+    ruta_index = carpeta_encoder / "index.faiss"
+    ruta_metadata = carpeta_encoder / "metadata.jsonl"
+    ruta_index_tmp = carpeta_encoder / "index.faiss.tmp"
+    ruta_metadata_tmp = carpeta_encoder / "metadata.jsonl.tmp"
 
-    with open(carpeta_encoder / "metadata.jsonl", "w", encoding="utf-8") as f:
-        for fragmento in fragmentos:
-            f.write(json.dumps(fragmento, ensure_ascii=False) + "\n")
+    try:
+        indice = construir_indice(vectores)
+        faiss.write_index(indice, str(ruta_index_tmp))
+
+        with open(ruta_metadata_tmp, "w", encoding="utf-8") as f:
+            for fragmento in fragmentos:
+                f.write(json.dumps(fragmento, ensure_ascii=False) + "\n")
+
+        # Ambas escrituras temporales completas: mover a destino final.
+        os.replace(ruta_index_tmp, ruta_index)
+        os.replace(ruta_metadata_tmp, ruta_metadata)
+    finally:
+        # Si algo falló antes de completar ambos replace, no debe quedar
+        # ningún archivo temporal huérfano en la carpeta de salida.
+        for tmp in (ruta_index_tmp, ruta_metadata_tmp):
+            if tmp.exists():
+                tmp.unlink()
 
 
 def main() -> None:

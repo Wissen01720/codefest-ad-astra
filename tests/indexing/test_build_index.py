@@ -67,6 +67,27 @@ def test_guardar_base_vectorial_falla_si_hay_descuadre_fragmentos_vectores(tmp_p
         guardar_base_vectorial(fragmentos, vectores, tmp_path, nombre_encoder="bge-m3")
 
 
+def test_guardar_base_vectorial_no_deja_par_descuadrado_si_falla_la_escritura(tmp_path):
+    vectores = _vectores_normalizados(3)
+    fragmentos = _fragmentos_de_prueba(3)
+    # Un set no es serializable por json: json.dumps fallará al llegar a este
+    # fragmento, a mitad del bucle de escritura de metadata.jsonl (después de
+    # que index.faiss ya se generó por completo). Esto simula una falla de
+    # I/O a mitad de camino y verifica que no queda un index.faiss "completo"
+    # junto a un metadata.jsonl ausente o truncado.
+    fragmentos[2]["texto"] = {"no", "serializable"}
+
+    with pytest.raises(TypeError):
+        guardar_base_vectorial(fragmentos, vectores, tmp_path, nombre_encoder="bge-m3")
+
+    carpeta = tmp_path / "encoder_bge-m3"
+    assert not (carpeta / "index.faiss").exists()
+    assert not (carpeta / "metadata.jsonl").exists()
+    # tampoco deben quedar temporales huérfanos
+    assert not (carpeta / "index.faiss.tmp").exists()
+    assert not (carpeta / "metadata.jsonl.tmp").exists()
+
+
 def test_indice_recuperado_devuelve_el_vecino_mas_cercano_esperado():
     vectores = _vectores_normalizados(4)
     indice = construir_indice(vectores)
