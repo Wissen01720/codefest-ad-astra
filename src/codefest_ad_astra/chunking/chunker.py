@@ -16,6 +16,7 @@ from .sentence_splitter import split_sentences
 from .tokenizer import count_tokens
 
 _SEPARADOR_PARRAFOS = re.compile(r"\n{2,}")
+_PATRON_PUNTUACION_ORACION = re.compile(r"[.!?]")
 
 
 def _dividir_en_parrafos(texto: str) -> list[str]:
@@ -109,18 +110,25 @@ def chunk_document(
             if tokens_oracion > max_tokens:
                 _cerrar_chunk_actual()
                 # Solo se activa el fallback de división por palabras cuando
-                # `split_sentences()` no encontró NINGÚN punto de corte en
-                # todo el párrafo (oraciones_parrafo tiene un único
-                # elemento: el párrafo entero). Esa es la firma de texto sin
-                # estructura de oraciones real (filas de CSV/XLSX/PBF sin
-                # puntuación de cierre en ningún lado) -- ver hallazgo #4 de
-                # la revisión de rama completa. Si en cambio el párrafo SÍ
-                # tiene varias oraciones y solo una de ellas es
-                # individualmente larga (prosa real), se deja sola tal cual
-                # (spec 3.3, "nunca corta una oración a mitad"): dividirla
-                # por palabras cortaría una oración real, que es justo lo
-                # que esta función tiene prohibido hacer.
-                if len(oraciones_parrafo) == 1:
+                # la unidad sobredimensionada no tiene NINGÚN punto de
+                # corte de oración ([.!?]) en absoluto -- esa es la firma
+                # real de texto tabular sin estructura de oraciones (filas
+                # de CSV/XLSX/PBF, "columna: valor" sin puntuación de
+                # cierre en ningún lado) -- ver hallazgo #4 de la revisión
+                # de rama completa.
+                #
+                # OJO: `len(oraciones_parrafo) == 1` NO es un gate válido
+                # para esto -- una oración real, larga, con puntuación de
+                # cierre normal (p. ej. una sola oración de 300 palabras
+                # que termina en '.') también produce `oraciones_parrafo`
+                # de longitud 1 (split_sentences no tiene nada que cortar
+                # dentro de una sola oración), pero SÍ debe dejarse sola
+                # verbatim, no dividirse por palabras (spec 3.3, "nunca
+                # corta una oración real a mitad"). El gate correcto es la
+                # ausencia total de puntuación de cierre en el texto crudo
+                # de la unidad, no el conteo de oraciones que devolvió
+                # split_sentences().
+                if not _PATRON_PUNTUACION_ORACION.search(oracion):
                     piezas = _partir_unidad_sobredimensionada(oracion, max_tokens, contar_tokens)
                     if len(piezas) > 1:
                         print(

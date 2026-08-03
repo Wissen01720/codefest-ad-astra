@@ -97,21 +97,22 @@ def test_solapamiento_repite_la_ultima_oracion_del_chunk_anterior():
     assert fragmentos[1].texto.startswith(ultima_oracion_chunk_0.rstrip("."))
 
 
-def test_oracion_individual_mas_grande_que_el_presupuesto_se_divide_por_palabras():
-    """Una "oración" sobredimensionada (aquí, una oración real y larga, pero
-    el mismo código de fallback también cubre el caso de texto tabular sin
-    puntuación -- ver test_documento_tabular_sin_puntuacion_se_divide_en_...)
-    ya no se emite verbatim por encima del presupuesto: se reparte en varias
-    piezas por palabras, cada una dentro de max_tokens, sin perder contenido."""
+def test_oracion_individual_mas_grande_que_el_presupuesto_se_emite_sola():
+    """Una oración real, larga, con puntuación de cierre normal (termina en
+    '.') sigue emitiéndose verbatim como un único chunk aunque exceda
+    max_tokens -- spec 3.3, "nunca corta una oración a mitad". El fallback
+    de división por palabras del hallazgo #4 NO debe activarse aquí: solo
+    aplica a unidades sin NINGÚN punto de corte de oración en absoluto
+    (texto tabular sin puntuación), no a cualquier "oración" que
+    split_sentences() devolvió sola -- ver
+    test_documento_tabular_sin_puntuacion_se_divide_en_varios_chunks para
+    el caso que sí debe dividirse."""
     oracion_larga = "Palabra " * 20 + "final."
     doc = _doc(oracion_larga.strip())
     fragmentos = chunk_document(doc, max_tokens=5, overlap_sentences=0, contar_tokens=_contar_palabras)
 
-    assert len(fragmentos) > 1
-    for fragmento in fragmentos:
-        assert fragmento.num_tokens <= 5
-    reconstruido = " ".join(f.texto for f in fragmentos)
-    assert reconstruido.split() == oracion_larga.strip().split()
+    assert len(fragmentos) == 1
+    assert fragmentos[0].texto == oracion_larga.strip()
 
 
 def test_palabra_unica_mas_grande_que_el_presupuesto_se_emite_sola():
