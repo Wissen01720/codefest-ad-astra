@@ -4,7 +4,11 @@ import faiss
 import numpy as np
 import pytest
 
-from codefest_ad_astra.indexing.build_index import construir_indice, guardar_base_vectorial
+from codefest_ad_astra.indexing.build_index import (
+    advertir_si_fragmentos_exceden_limite_modelo,
+    construir_indice,
+    guardar_base_vectorial,
+)
 
 
 def _vectores_normalizados(n: int, dim: int = 4) -> np.ndarray:
@@ -96,3 +100,45 @@ def test_indice_recuperado_devuelve_el_vecino_mas_cercano_esperado():
 
     assert ids[0][0] == 0  # el vecino más cercano de un vector es él mismo
     assert puntuaciones[0][0] == pytest.approx(1.0, abs=1e-4)  # coseno consigo mismo == 1
+
+
+class _ModeloFalso:
+    """Simula solo lo que necesita la guardia: un atributo `max_seq_length`,
+    como lo exponen los modelos reales de sentence-transformers."""
+
+    def __init__(self, max_seq_length):
+        self.max_seq_length = max_seq_length
+
+
+def test_advertir_si_fragmentos_exceden_limite_modelo_dispara_aviso(capsys):
+    fragmentos = _fragmentos_de_prueba(2)
+    fragmentos[0]["num_tokens"] = 600  # excede max_seq_length=512
+    fragmentos[1]["num_tokens"] = 100
+
+    advertir_si_fragmentos_exceden_limite_modelo(fragmentos, _ModeloFalso(max_seq_length=512))
+
+    salida_error = capsys.readouterr().err
+    assert "Aviso" in salida_error
+    assert "1 fragmento" in salida_error
+    assert "512" in salida_error
+
+
+def test_advertir_si_fragmentos_exceden_limite_modelo_no_dispara_si_todo_cabe(capsys):
+    fragmentos = _fragmentos_de_prueba(2)
+    fragmentos[0]["num_tokens"] = 400
+    fragmentos[1]["num_tokens"] = 100
+
+    advertir_si_fragmentos_exceden_limite_modelo(fragmentos, _ModeloFalso(max_seq_length=512))
+
+    assert capsys.readouterr().err == ""
+
+
+def test_advertir_si_fragmentos_exceden_limite_modelo_no_falla_sin_max_seq_length(capsys):
+    fragmentos = _fragmentos_de_prueba(2)
+
+    class _ModeloSinAtributo:
+        pass
+
+    advertir_si_fragmentos_exceden_limite_modelo(fragmentos, _ModeloSinAtributo())
+
+    assert capsys.readouterr().err == ""

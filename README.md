@@ -2,9 +2,9 @@
 
 Proyecto para la Etapa 1 (fase virtual) del CODEFEST AD ASTRA 2026 (Universidad de los Andes / Fuerza Aeroespacial Colombiana). Objetivo del reto: construir una base de conocimiento vectorial (FAISS + metadata + encoder(s), opcionalmente grafo de conocimiento) a partir de un corpus multiformato sobre tres fenómenos (IA en defensa, seguridad espacial/LEO, dinámicas territoriales en LATAM), y responder 50 consultas (`q001`-`q050`) devolviendo top-3 documentos y top-10 fragmentos por consulta en `resultados.jsonl`.
 
-## Estado actual: Fase 1 (extracción) + Fase 2 (limpieza) completas
+## Estado actual: Fase 1 (extracción) + Fase 2 (limpieza) + Fase 3 (chunking) + Fase 4 (embeddings + índice FAISS) completas
 
-Lo construido hasta ahora cubre el **preprocesamiento de fuentes** (Sección 2 de la especificación). Chunking, encoders, índice FAISS, recuperación y grafo de conocimiento **todavía no están implementados**.
+Lo construido hasta ahora cubre el **preprocesamiento de fuentes** (Sección 2), el **chunking** (Sección 3) y la **generación de embeddings + índice FAISS** (Secciones 4-5) de la especificación. Recuperación y grafo de conocimiento **todavía no están implementados**.
 
 ### Punto de entrada único para lo ya construido
 
@@ -62,18 +62,36 @@ Re-validar PDFs a gran escala:
 uv run python -m codefest_ad_astra.ingest.batch_runner --corpus <ruta>
 ```
 
+### Módulos implementados (`src/codefest_ad_astra/chunking/` y `src/codefest_ad_astra/indexing/`)
+
+| Módulo | Rol |
+|---|---|
+| `chunking/sentence_splitter.py` | Divisor de oraciones ES/EN/PT por heurística de puntuación, sin cortar abreviaturas/decimales/puntos suspensivos |
+| `chunking/tokenizer.py` | Conteo de tokens vía el tokenizer real del encoder (`DEFAULT_ENCODER`, fuente única de verdad para el modelo por defecto de todo el pipeline) |
+| `chunking/fragment.py` | Modelo `Fragment` con la metadata obligatoria de la Tabla 1 (`doc_id`, `chunk_id`, `fuente`, `formato`, `fenomeno`, `posicion`, `num_tokens`, `texto`) |
+| `chunking/chunker.py` | `chunk_document`: empaqueta párrafos completos dentro del presupuesto de tokens, bajando a nivel oración solo cuando un párrafo no cabe; nunca corta una oración a mitad. Incluye un fallback de división por palabras para unidades sin estructura de oraciones (texto tabular de CSV/XLSX/PBF) que de otro modo excederían el presupuesto de tokens muy por encima del límite |
+| `chunking/pipeline.py` | CLI Fase 3: `documentos.jsonl` -> `fragments.jsonl` |
+| `indexing/encoder.py` | Wrapper sobre `sentence-transformers`: embeddings normalizados a norma unitaria (para que `IndexFlatIP` equivalga a similitud coseno) |
+| `indexing/build_index.py` | CLI Fase 4: genera embeddings de `fragments.jsonl` y construye/persiste `index.faiss` + `metadata.jsonl` en `base_vectorial/encoder_<nombre>/`, escritos atómicamente |
+
+Cómo correr el pipeline de chunking + indexado:
+
+```bash
+uv run python -m codefest_ad_astra.chunking.pipeline --documentos data/processed/documentos.jsonl --salida data/processed/fragments.jsonl
+uv run python -m codefest_ad_astra.indexing.build_index --fragmentos data/processed/fragments.jsonl --salida base_vectorial --encoder-nombre bge-m3
+```
+
+**Nota sobre cambiar de encoder:** el `--modelo` de `build_index` (embeddings) y el modelo usado por `chunking.pipeline` para contar tokens (Sección 3) deben ser el mismo -- el chunking dimensiona cada fragmento contra el límite de tokens de un modelo específico. Cambiar `--modelo` en `build_index` sin volver a correr `chunking.pipeline` con el tokenizer del nuevo modelo puede dejar fragmentos mal dimensionados para el modelo de embeddings real (`build_index` ahora advierte por stderr si detecta fragmentos que exceden `max_seq_length` del modelo cargado, pero no lo corrige automáticamente). Swapear de encoder no es, hoy, un cambio de una sola bandera.
+
 ## Pendiente (no implementado)
 
 Según la especificación técnica (`CODEFEST_2026-1.pdf`), falta:
 
-1. **Chunking** (Sección 3): fragmentar `documentos.jsonl` con la estrategia elegida, respetando completitud lingüística (sin cortar oraciones) y generando la metadata obligatoria por fragmento (`doc_id`, `chunk_id`, `fuente`, `formato`, `fenomeno`, `posicion`, `num_tokens`, `texto`).
-2. **Encoder(s)** (Sección 4): elegir modelo(s) encoder multilingüe(s) de HuggingFace (prohibido usar decoders/LLMs generativos en esta etapa).
-3. **Índice FAISS** (Sección 5): construir `index.faiss` + `metadata.jsonl` por encoder (probablemente `IndexFlatIP` con vectores normalizados dado el volumen del corpus).
-4. **Módulo de recuperación** (Sección 8): búsqueda por similitud coseno, combinación de múltiples encoders si aplica (CombSUM/CombMNZ/RRF), agregación a nivel documento, post-filtros por metadata.
-5. **Formato de salida** (Sección 9): generar `resultados.jsonl` con las 50 consultas, top-3 documentos y top-10 fragmentos (≤250 palabras c/u).
-6. **Script `generador.py`** que reproduzca `resultados.jsonl` a partir del índice.
-7. **Documento técnico** (PDF, máx. 8 páginas) con justificación de decisiones de diseño.
-8. *(Bonus, opcional)* **Grafo de conocimiento** (Sección 7): NER + extracción de relaciones + integración con la recuperación vectorial.
+1. **Módulo de recuperación** (Sección 8): búsqueda por similitud coseno, combinación de múltiples encoders si aplica (CombSUM/CombMNZ/RRF), agregación a nivel documento, post-filtros por metadata.
+2. **Formato de salida** (Sección 9): generar `resultados.jsonl` con las 50 consultas, top-3 documentos y top-10 fragmentos (≤250 palabras c/u).
+3. **Script `generador.py`** que reproduzca `resultados.jsonl` a partir del índice.
+4. **Documento técnico** (PDF, máx. 8 páginas) con justificación de decisiones de diseño.
+5. *(Bonus, opcional)* **Grafo de conocimiento** (Sección 7): NER + extracción de relaciones + integración con la recuperación vectorial.
 
 ## Estructura de entrega esperada (aún no creada)
 

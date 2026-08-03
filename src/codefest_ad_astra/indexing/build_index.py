@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import faiss
@@ -98,6 +99,37 @@ def guardar_base_vectorial(
                 tmp.unlink()
 
 
+def advertir_si_fragmentos_exceden_limite_modelo(fragmentos: list[dict], modelo) -> None:
+    """Compara `num_tokens` de cada fragmento contra `max_seq_length` del
+    modelo de embeddings cargado y avisa por stderr si alguno lo excede.
+
+    No es infalible como guardia (spec 4.3): el chunking (Fase 3) cuenta
+    tokens con el tokenizer de un modelo específico (`chunking.tokenizer.
+    DEFAULT_ENCODER` salvo que se haya corrido con otro), y nada impide
+    correr `build_index.py --modelo <otro-modelo>` sobre un fragments.jsonl
+    dimensionado para un modelo distinto -- los límites de tokens de dos
+    tokenizers no son directamente comparables en general, pero un fragmento
+    cuyo `num_tokens` ya excede `max_seq_length` del modelo de embeddings es
+    una señal inequívoca de descuadre, así que al menos ese caso se detecta
+    y se reporta. No se aborta la corrida (dado el tiempo del hackathon, un
+    aviso visible es suficiente); `sentence-transformers` trunca en
+    silencio por su cuenta al codificar.
+    """
+    max_seq_length = getattr(modelo, "max_seq_length", None)
+    if max_seq_length is None:
+        return
+
+    excedidos = [f for f in fragmentos if f.get("num_tokens", 0) > max_seq_length]
+    if excedidos:
+        print(
+            f"[build_index] Aviso: {len(excedidos)} fragmento(s) tienen num_tokens > "
+            f"max_seq_length={max_seq_length} del modelo cargado -- probablemente el "
+            "chunking (Fase 3) se corrió con un tokenizer/modelo distinto al de "
+            "--modelo aquí. Esos fragmentos serán truncados en silencio al codificar.",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fase 4: embeddings + índice FAISS")
     parser.add_argument("--fragmentos", type=Path, required=True)
@@ -114,6 +146,7 @@ def main() -> None:
     textos = [f["texto"] for f in fragmentos]
 
     modelo = load_encoder(args.modelo)
+    advertir_si_fragmentos_exceden_limite_modelo(fragmentos, modelo)
     vectores = encode_texts(modelo, textos, batch_size=args.batch_size)
 
     guardar_base_vectorial(fragmentos, vectores, args.salida, args.encoder_nombre)

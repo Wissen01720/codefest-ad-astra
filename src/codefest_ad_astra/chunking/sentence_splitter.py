@@ -22,7 +22,7 @@ _PATRON_ABREVIATURA = re.compile(
 _PATRON_DECIMAL = re.compile(r"(?<=\d)\.(?=\d)")
 _PATRON_ELIPSIS = re.compile(r"\.\.\.")
 _PATRON_CORTE = re.compile(
-    r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑÀ-Ý0-9¿¡""(])'
+    r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑÀ-Ý0-9¿¡"“‘—(])'
 )
 
 
