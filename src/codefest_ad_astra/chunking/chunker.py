@@ -42,15 +42,22 @@ def chunk_document(
     buffer: list[str] = []
     buffer_tokens = 0
     textos_de_chunks: list[str] = []
+    # Rastrea si `buffer` recibió contenido nuevo desde el último cierre.
+    # Sin esto, dos cierres consecutivos sin un `buffer.append()` entre
+    # medio (p. ej. dos oraciones sobredimensionadas seguidas) reemiten el
+    # mismo `buffer` (la cola de overlap) como un chunk duplicado -- ver
+    # regresión en test_oraciones_sobredimensionadas_consecutivas_no_duplican_chunk.
+    buffer_tiene_contenido_nuevo = False
 
     def _cerrar_chunk_actual() -> None:
-        nonlocal buffer, buffer_tokens
-        if not buffer:
+        nonlocal buffer, buffer_tokens, buffer_tiene_contenido_nuevo
+        if not buffer or not buffer_tiene_contenido_nuevo:
             return
         textos_de_chunks.append(" ".join(buffer))
         cola = buffer[-overlap_sentences:] if overlap_sentences > 0 else []
         buffer = list(cola)
         buffer_tokens = sum(contar_tokens(o) for o in buffer)
+        buffer_tiene_contenido_nuevo = False
 
     for parrafo in parrafos:
         oraciones_parrafo = split_sentences(parrafo)
@@ -62,6 +69,7 @@ def chunk_document(
         if buffer_tokens + tokens_parrafo <= max_tokens:
             buffer.extend(oraciones_parrafo)
             buffer_tokens += tokens_parrafo
+            buffer_tiene_contenido_nuevo = True
             continue
 
         for oracion in oraciones_parrafo:
@@ -77,6 +85,7 @@ def chunk_document(
 
             buffer.append(oracion)
             buffer_tokens += tokens_oracion
+            buffer_tiene_contenido_nuevo = True
 
     _cerrar_chunk_actual()
 

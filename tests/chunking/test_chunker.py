@@ -100,3 +100,20 @@ def test_num_tokens_usa_la_funcion_de_conteo_inyectada():
     fragmentos = chunk_document(doc, max_tokens=100, contar_tokens=_contar_palabras)
 
     assert fragmentos[0].num_tokens == _contar_palabras(fragmentos[0].texto)
+
+
+def test_oraciones_sobredimensionadas_consecutivas_no_duplican_chunk():
+    """Regresión: dos oraciones sobredimensionadas seguidas no deben hacer
+    que el buffer congelado (la cola de overlap) se reemita dos veces como
+    chunks duplicados con texto idéntico.
+    """
+    oracion_corta = "Uno dos tres."
+    oracion_grande_1 = "Palabra " * 10 + "fin uno."
+    oracion_grande_2 = "Palabra " * 10 + "fin dos."
+    texto = f"{oracion_corta} {oracion_grande_1} {oracion_grande_2}"
+    doc = _doc(texto)
+
+    fragmentos = chunk_document(doc, max_tokens=5, overlap_sentences=1, contar_tokens=_contar_palabras)
+
+    textos = [f.texto for f in fragmentos]
+    assert len(textos) == len(set(textos)), f"chunks duplicados en: {textos}"
