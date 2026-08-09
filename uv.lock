@@ -371,9 +371,8 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pytesseract", specifier = ">=0.3.13" },
     { name = "sentence-transformers", specifier = ">=5.6.1" },
-    { name = "transformers", specifier = ">=5.14.1" },
+    { name = "transformers", specifier = ">=4.44.0" },
 ]
-provides-extras = ["test", "chunking"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.1.1" }]
