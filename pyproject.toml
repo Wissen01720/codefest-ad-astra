@@ -32,6 +32,9 @@ chunking = []
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "integracion: usa un encoder real de sentence-transformers (necesita el modelo en cache o red)",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]
