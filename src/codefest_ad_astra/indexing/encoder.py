@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from ..chunking.tokenizer import DEFAULT_ENCODER
+DEFAULT_ENCODER = "BAAI/bge-m3"
 
 __all__ = ["DEFAULT_ENCODER", "load_encoder", "encode_texts"]
 

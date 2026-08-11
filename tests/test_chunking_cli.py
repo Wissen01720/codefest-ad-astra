@@ -198,6 +198,28 @@ def test_tokenizer_load_error_returns_one(tmp_path: Path) -> None:
     assert "No se pudo cargar tokenizer" in str(excinfo.value)
 
 
+def test_create_transformer_token_counter_uses_offline_flag(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class DummyTokenizer:
+        def __call__(self, text, add_special_tokens=True, truncation=False):
+            return {"input_ids": [1, 2, 3]}
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda model_name, **kwargs: captured.update({"model_name": model_name, "kwargs": kwargs}) or DummyTokenizer(),
+    )
+
+    token_counter = create_transformer_token_counter("dummy-model")
+
+    assert token_counter.count("hola mundo") == 3
+    assert captured["model_name"] == "dummy-model"
+    assert captured["kwargs"]["use_fast"] is True
+    assert captured["kwargs"]["local_files_only"] is True
+
+
 def test_on_oversize_fail_returns_one(tmp_path: Path) -> None:
     input_path = tmp_path / "corpus.jsonl"
     write_jsonl(input_path, [

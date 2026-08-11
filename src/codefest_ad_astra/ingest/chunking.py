@@ -79,10 +79,30 @@ class TransformerTokenCounter(TokenCounter):
         return len(encoded["input_ids"])
 
 
+def _count_unit_tokens(token_counter: TokenCounter, text: str) -> int:
+    if isinstance(token_counter, TransformerTokenCounter):
+        encoded = token_counter._tokenizer(text, add_special_tokens=True, truncation=False)
+        return len(encoded["input_ids"])
+    return count_words(text)
+
+
+def _clamp_span(base_start: int, base_end: int, start: int, end: int) -> Optional[tuple[int, int]]:
+    start = max(base_start, start)
+    end = min(base_end, end)
+    if start >= end:
+        return None
+    return start, end
+
+
 def create_transformer_token_counter(model_name: str) -> TokenCounter:
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    offline_mode = os.getenv("HF_HUB_OFFLINE") == "1" or os.getenv("TRANSFORMERS_OFFLINE") == "1"
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        use_fast=True,
+        local_files_only=offline_mode,
+    )
     return TransformerTokenCounter(tokenizer)
 
 
@@ -210,11 +230,12 @@ def _is_heading_line(line: str) -> bool:
     return True
 
 
-def _get_previous_token(text: str, index: int) -> str:
-    prefix = text[:index].rstrip()
+def _get_previous_token(text: str, index: int, window: int = 64) -> str:
+    start = max(0, index - window)
+    prefix = text[start:index].rstrip()
     if not prefix:
         return ""
-    match = re.search(r"([\w\.]+)$", prefix)
+    match = re.search(r"([\w.]+)$", prefix)
     return match.group(1) if match else ""
 
 
@@ -228,12 +249,12 @@ def _get_next_char(text: str, index: int) -> Optional[str]:
     return None
 
 
-def _is_decimal_boundary(text: str, dot_index: int) -> bool:
+def _is_decimal_boundary(text: str, dot_index: int, window: int = 32) -> bool:
     prev_token = _get_previous_token(text, dot_index)
     if not prev_token.isdigit():
         return False
 
-    suffix = text[dot_index:]
+    suffix = text[dot_index:dot_index + window]
     return bool(re.match(r"^[\.,]\d+(?:[\.,]\d+)*", suffix))
 
 
@@ -449,6 +470,8 @@ def _choose_chunk_indices(
     original_text: str,
     config: ChunkingConfig,
     token_counter: TokenCounter,
+    sentence_content_token_prefixes: Sequence[int],
+    sentence_word_prefixes: Sequence[int],
 ) -> list[int]:
     if start_index >= len(sentences):
         return []
@@ -463,9 +486,8 @@ def _choose_chunk_indices(
         if index > start_index and sentence.is_heading:
             break
 
-        candidate_text = original_text[chunk_start:sentence.char_end]
-        candidate_tokens = token_counter.count(candidate_text)
-        candidate_words = count_words(candidate_text)
+        candidate_tokens = sentence_content_token_prefixes[index + 1] - sentence_content_token_prefixes[start_index]
+        candidate_words = sentence_word_prefixes[index + 1] - sentence_word_prefixes[start_index]
 
         if candidate_tokens > config.max_tokens or candidate_words > config.max_words:
             broken_by_limit = True
@@ -512,15 +534,19 @@ def _split_long_sentence_on_whitespace(
     if not words:
         return []
 
+    word_content_tokens = [_count_unit_tokens(token_counter, word) for word, _, _ in words]
+    word_prefixes = [0]
+    for token_count in word_content_tokens:
+        word_prefixes.append(word_prefixes[-1] + token_count)
+
     segments: list[Sentence] = []
     seg_start = 0
 
     i = 0
     while i < len(words):
         # try to expand segment from seg_start up to i
-        seg_text = text[words[seg_start][1] : words[i][2]]
         seg_words = i - seg_start + 1
-        seg_tokens = token_counter.count(seg_text)
+        seg_tokens = word_prefixes[i + 1] - word_prefixes[seg_start]
         if seg_tokens > config.max_tokens or seg_words > config.max_words:
             # if adding the current word breaks the limits and the segment
             # would be empty (single word), we cannot split safely
@@ -531,6 +557,10 @@ def _split_long_sentence_on_whitespace(
             prev_end = words[i][1]
             seg_char_start = sentence.char_start + words[seg_start][1]
             seg_char_end = sentence.char_start + prev_end
+            bounded = _clamp_span(sentence.char_start, sentence.char_end, seg_char_start, seg_char_end)
+            if bounded is None:
+                return []
+            seg_char_start, seg_char_end = bounded
             seg_slice = text[words[seg_start][1] : prev_end]
             segments.append(
                 Sentence(
@@ -554,6 +584,10 @@ def _split_long_sentence_on_whitespace(
         last_end = words[-1][2]
         seg_char_start = sentence.char_start + words[seg_start][1]
         seg_char_end = sentence.char_start + last_end
+        bounded = _clamp_span(sentence.char_start, sentence.char_end, seg_char_start, seg_char_end)
+        if bounded is None:
+            return []
+        seg_char_start, seg_char_end = bounded
         seg_slice = text[words[seg_start][1] : last_end]
         segments.append(
             Sentence(
@@ -590,15 +624,54 @@ def _split_structured_pairs(
     pairs: list[tuple[int, int]] = []  # (start, end) offsets relative to sentence
     bad_pair_flags: list[bool] = []
     if "|" in text or ";" in text:
-        # split preserving offsets by locating parts in the original text
+        # Split preserving offsets using the separator matches themselves
+        # (finditer), NOT text.find() on the stripped part content. This
+        # formato (csv/xlsx/pbf) frequently uses '|' both as the outer pair
+        # separator (' | ', with spaces) and as a bare in-value
+        # sub-separator (e.g. 'Sponsor/Collaborators: A|B|C'), and across a
+        # concatenated multi-row document the same short values repeat many
+        # times (e.g. 'Completed', 'Not Applicable'). Locating each part by
+        # searching for its text from a heuristically-advanced offset (the
+        # previous implementation used a fixed `offset += 3` guess for the
+        # separator width) can miss the real occurrence and/or lock onto a
+        # later duplicate occurrence, silently corrupting every subsequent
+        # offset — up to and including producing spans past len(text), which
+        # drops real content from the final segment. Using the separator
+        # match spans directly makes every offset exact regardless of
+        # duplicate content.
         sep_re = re.compile(r"\s*\|\s*|\s*;\s*")
-        parts = list(sep_re.split(text))
-        offset = 0
-        for part in parts:
-            part = part.strip()
-            if not part:
-                offset += 3
+        cursor = 0
+        raw_spans: list[tuple[int, int, int]] = []  # (content_start, content_end, pair_end_incl_sep)
+        for m in sep_re.finditer(text):
+            raw_spans.append((cursor, m.start(), m.end()))
+            cursor = m.end()
+        raw_spans.append((cursor, len(text), len(text)))
+
+        pending_start: Optional[int] = None  # unattached separator(s) awaiting a pair to absorb them
+        for content_start, content_end, pair_end in raw_spans:
+            s, e = content_start, content_end
+            while s < e and text[s].isspace():
+                s += 1
+            while e > s and text[e - 1].isspace():
+                e -= 1
+            if s >= e:
+                # No key/value content between the previous separator and
+                # this one — e.g. two separators back-to-back, or (as
+                # happens when a sentence boundary lands mid-record) the
+                # sentence text starts directly with a bare '|' with no
+                # preceding content of its own. The separator character(s)
+                # themselves are still non-whitespace content that
+                # _validate_chunk_sequence requires to be covered, so we
+                # can't just drop this span: absorb it into the previous
+                # pair's end if one exists, otherwise stash it as a pending
+                # prefix to be absorbed by the start of the next real pair.
+                if pairs:
+                    prev_start, _ = pairs[-1]
+                    pairs[-1] = (prev_start, pair_end)
+                elif pending_start is None:
+                    pending_start = content_start
                 continue
+            part = text[s:e]
             colon = part.find(":")
             # determine if this part looks like a proper 'key: value'
             if colon == -1:
@@ -606,21 +679,17 @@ def _split_structured_pairs(
             else:
                 key = part[:colon].strip()
                 is_bad = not bool(re.match(r"^[^\d\W][\w\-]*$", key))
-            # find the real location of this part in the original text
-            part_idx = text.find(part, offset)
-            if part_idx == -1:
-                part_idx = offset
-            # include the separator after the part (if present) so that
-            # non-whitespace separators (e.g. '|', ';') are covered by
-            # the resulting segments and chunk coverage checks.
-            sep_match = sep_re.search(text, part_idx + len(part))
-            if sep_match:
-                pair_end = sep_match.end()
-            else:
-                pair_end = part_idx + len(part)
-            pairs.append((part_idx, pair_end))
+            effective_start = pending_start if pending_start is not None else s
+            pending_start = None
+            pairs.append((effective_start, pair_end))
             bad_pair_flags.append(is_bad)
-            offset = pair_end
+        # If the sentence ends with only bare separators after the last real
+        # pair (or contains no real pair content at all), pending_start may
+        # still hold an unabsorbed leading separator span with nothing to
+        # attach it to — extend the last pair (if any) to cover it.
+        if pending_start is not None and pairs:
+            prev_start, _ = pairs[-1]
+            pairs[-1] = (prev_start, len(text))
     else:
         # match a single-token key (no internal spaces) to avoid consuming
         # preceding value tokens as part of the next key in compact lists
@@ -634,16 +703,17 @@ def _split_structured_pairs(
             pairs.append((start, end))
 
     segments: list[Sentence] = []
+    pair_content_tokens = [_count_unit_tokens(token_counter, text[p_start:p_end]) for p_start, p_end in pairs]
     # Greedy grouping: accumulate pairs until adding next would exceed limits.
     cur_start = 0
-    cur_tokens = 0
+    cur_content_tokens = 0
     cur_words = 0
     cur_text_start = pairs[0][0]
     cur_pair_index = 0
     for idx, (p_start, p_end) in enumerate(pairs):
         pair_text = text[p_start:p_end]
-        pair_tokens = token_counter.count(pair_text)
         pair_words = count_words(pair_text)
+        pair_tokens = pair_content_tokens[idx]
 
         # if single pair exceeds limits, hard-split it
         if pair_tokens > config.max_tokens or pair_words > config.max_words:
@@ -654,6 +724,10 @@ def _split_structured_pairs(
             if cur_words > 0:
                 seg_char_start = sentence.char_start + cur_text_start
                 seg_char_end = sentence.char_start + pairs[idx - 1][1]
+                bounded = _clamp_span(sentence.char_start, sentence.char_end, seg_char_start, seg_char_end)
+                if bounded is None:
+                    return []
+                seg_char_start, seg_char_end = bounded
                 seg_slice = text[cur_text_start : pairs[idx - 1][1]]
                 bad_in_group = any(bad_pair_flags[j] for j in range(cur_pair_index, idx)) if bad_pair_flags else False
                 fr = "possible_separator_in_value" if bad_in_group else "structured"
@@ -668,7 +742,7 @@ def _split_structured_pairs(
                         fallback_reason=fr,
                     )
                 )
-                cur_tokens = 0
+                cur_content_tokens = 0
                 cur_words = 0
             # add hard segments
             segments.extend(hard_segments)
@@ -676,13 +750,19 @@ def _split_structured_pairs(
             if idx + 1 < len(pairs):
                 cur_text_start = pairs[idx + 1][0]
                 cur_pair_index = idx + 1
+                cur_content_tokens = 0
+                cur_words = 0
             continue
 
         # if adding this pair would exceed limits, flush current group first
-        if cur_words + pair_words > config.max_words or cur_tokens + pair_tokens > config.max_tokens:
+        if cur_words + pair_words > config.max_words or cur_content_tokens + pair_tokens > config.max_tokens:
             # finalize current group
             seg_char_start = sentence.char_start + cur_text_start
             seg_char_end = sentence.char_start + pairs[idx - 1][1]
+            bounded = _clamp_span(sentence.char_start, sentence.char_end, seg_char_start, seg_char_end)
+            if bounded is None:
+                return []
+            seg_char_start, seg_char_end = bounded
             seg_slice = text[cur_text_start : pairs[idx - 1][1]]
             bad_in_group = any(bad_pair_flags[j] for j in range(cur_pair_index, idx)) if bad_pair_flags else False
             fr = "possible_separator_in_value" if bad_in_group else "structured"
@@ -700,19 +780,23 @@ def _split_structured_pairs(
             # start new group with current pair
             cur_text_start = p_start
             cur_pair_index = idx
-            cur_tokens = pair_tokens
+            cur_content_tokens = pair_tokens
             cur_words = pair_words
         else:
             # accumulate
             if cur_words == 0:
                 cur_text_start = p_start
-            cur_tokens += pair_tokens
+            cur_content_tokens += pair_tokens
             cur_words += pair_words
 
     # flush remaining group
     if cur_words > 0:
         seg_char_start = sentence.char_start + cur_text_start
         seg_char_end = sentence.char_start + pairs[-1][1]
+        bounded = _clamp_span(sentence.char_start, sentence.char_end, seg_char_start, seg_char_end)
+        if bounded is None:
+            return []
+        seg_char_start, seg_char_end = bounded
         seg_slice = text[cur_text_start : pairs[-1][1]]
         bad_in_group = any(bad_pair_flags[j] for j in range(cur_pair_index, len(pairs))) if bad_pair_flags else False
         fr = "possible_separator_in_value" if bad_in_group else "structured"
@@ -761,30 +845,71 @@ def _split_structured_pairs(
     return merged
 
 
-def _hard_split_by_chars(pair_text: str, block_index: int, is_heading: bool, base_char_start: int, config: ChunkingConfig, token_counter: TokenCounter) -> list[Sentence]:
-    """Hard character-based split of a single pair_text. Returns list of Sentence.
+def _find_max_fit(
+    pair_text: str,
+    start: int,
+    n: int,
+    config: ChunkingConfig,
+    token_counter: TokenCounter,
+) -> int:
+    """Mayor `end` tal que pair_text[start:end] respeta max_tokens/max_words.
+    Precondición: pair_text[start:start+1] ya cabe dentro de los límites."""
 
-    This is used as last resort when a pair itself exceeds token/word limits.
-    """
+    def fits(end: int) -> bool:
+        sub = pair_text[start:end]
+        return (
+            token_counter.count(sub) <= config.max_tokens
+            and count_words(sub) <= config.max_words
+        )
+
+    lo, hi = start + 1, start + 2
+    while hi <= n and fits(hi):
+        lo = hi
+        hi = start + (hi - start) * 2
+    hi = min(hi, n + 1)
+
+    if hi > n:
+        return n
+
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _hard_split_by_chars(
+    pair_text: str,
+    block_index: int,
+    is_heading: bool,
+    base_char_start: int,
+    config: ChunkingConfig,
+    token_counter: TokenCounter
+) -> list[Sentence]:
+
     segments: list[Sentence] = []
     start = 0
     n = len(pair_text)
-    # advance by trying to make the largest substring that fits
+
     while start < n:
-        # if a single character already exceeds token limit, cannot split
-        if token_counter.count(pair_text[start:start+1]) > config.max_tokens:
+        if (
+            token_counter.count(pair_text[start:start + 1])
+            > config.max_tokens
+        ):
             return []
-        end = start + 1
-        last_good = end
-        while end <= n:
-            sub = pair_text[start:end]
-            if token_counter.count(sub) > config.max_tokens or count_words(sub) > config.max_words:
-                break
-            last_good = end
-            end += 1
+
+        last_good = _find_max_fit(pair_text, start, n, config, token_counter)
+
         seg_char_start = base_char_start + start
         seg_char_end = base_char_start + last_good
+        bounded = _clamp_span(base_char_start, base_char_start + n, seg_char_start, seg_char_end)
+        if bounded is None:
+            return []
+        seg_char_start, seg_char_end = bounded
         seg_slice = pair_text[start:last_good]
+
         segments.append(
             Sentence(
                 text=seg_slice,
@@ -796,7 +921,9 @@ def _hard_split_by_chars(pair_text: str, block_index: int, is_heading: bool, bas
                 fallback_reason="hard-split",
             )
         )
+
         start = last_good
+
     return segments
 
 
@@ -843,18 +970,92 @@ def _validate_chunk_sequence(chunks: Sequence[ChunkRecord], original_text: str, 
         else:
             continue
 
+    def _gap_error(pos: int) -> FatalChunkingError:
+        snippet_start = max(0, pos - 60)
+        snippet_end = min(len(original_text), pos + 60)
+        snippet = original_text[snippet_start:snippet_end].replace("\n", "\\n")
+        return FatalChunkingError(
+            f"Contenido no vacío no cubierto por los chunks en char_offset={pos} "
+            f"(cerca de {len(merged)} rangos cubiertos, primer/último char cubierto: "
+            f"{merged[0][0] if merged else None}/{merged[-1][1] if merged else None}). "
+            f"Contexto: ...{snippet!r}..."
+        )
+
     # check coverage of non-whitespace characters
     current = 0
     for start, end in merged:
         while current < start:
             if original_text[current].strip():
-                raise FatalChunkingError("Contenido no vacío no cubierto por los chunks.")
+                raise _gap_error(current)
             current += 1
         current = max(current, end)
     while current < len(original_text):
         if original_text[current].strip():
-            raise FatalChunkingError("Contenido no vacío no cubierto por los chunks.")
+            raise _gap_error(current)
         current += 1
+
+
+def _chunk_meets_limits(chunk_text: str, config: ChunkingConfig, token_counter: TokenCounter) -> bool:
+    return token_counter.count(chunk_text) <= config.max_tokens and count_words(chunk_text) <= config.max_words
+
+
+def _splice_sentences_and_update_stats(
+    sentences: list[Sentence],
+    sentence_content_tokens: list[int],
+    sentence_word_counts: list[int],
+    sentence_content_token_prefixes: list[int],
+    sentence_word_prefixes: list[int],
+    index: int,
+    new_sentences: list[Sentence],
+    texto: str,
+    token_counter: TokenCounter,
+) -> tuple[list[Sentence], list[int], list[int], list[int], list[int]]:
+    """Reemplaza sentences[index] por new_sentences.
+
+    Tokeniza *solo* los fragmentos nuevos (no todo el documento otra vez) y
+    reconstruye los prefix-sums únicamente a partir de `index` en adelante,
+    con sumas de enteros (barato) en vez de retokenizar cada oración del
+    documento. Antes de este fix, cada fallback de split (estructurado o
+    por whitespace) recalculaba sentence_slices/sentence_content_tokens/
+    sentence_word_counts para TODAS las oraciones vía _count_unit_tokens,
+    lo cual con un tokenizer real (TransformerTokenCounter) implica una
+    llamada al modelo por oración en cada recompute — con documentos de
+    cientos de miles de oraciones (p.ej. filas de un CSV grande) y muchos
+    fallbacks, esto degenera en un patrón O(n^2) de llamadas al tokenizer
+    que se percibe como el proceso colgado.
+    """
+    new_slices = [texto[s.char_start:s.char_end] for s in new_sentences]
+    new_content_tokens = [_count_unit_tokens(token_counter, s) for s in new_slices]
+    new_word_counts = [count_words(s) for s in new_slices]
+
+    sentences = sentences[:index] + new_sentences + sentences[index + 1:]
+    sentence_content_tokens = (
+        sentence_content_tokens[:index] + new_content_tokens + sentence_content_tokens[index + 1:]
+    )
+    sentence_word_counts = (
+        sentence_word_counts[:index] + new_word_counts + sentence_word_counts[index + 1:]
+    )
+
+    # Los prefijos antes de `index` no cambian. Se reconstruyen solo desde
+    # ahí, sumando enteros — nada de retokenizar.
+    base_tokens = sentence_content_token_prefixes[index]
+    base_words = sentence_word_prefixes[index]
+    tail_content_prefixes = [base_tokens]
+    tail_word_prefixes = [base_words]
+    for tok, wc in zip(sentence_content_tokens[index:], sentence_word_counts[index:]):
+        tail_content_prefixes.append(tail_content_prefixes[-1] + tok)
+        tail_word_prefixes.append(tail_word_prefixes[-1] + wc)
+
+    sentence_content_token_prefixes = sentence_content_token_prefixes[:index] + tail_content_prefixes
+    sentence_word_prefixes = sentence_word_prefixes[:index] + tail_word_prefixes
+
+    return (
+        sentences,
+        sentence_content_tokens,
+        sentence_word_counts,
+        sentence_content_token_prefixes,
+        sentence_word_prefixes,
+    )
 
 
 def build_chunks_for_document(
@@ -875,6 +1076,19 @@ def build_chunks_for_document(
             sentence.block_index = block_index
         sentences.extend(block_sentences)
 
+    sentence_slices = [texto[sentence.char_start:sentence.char_end] for sentence in sentences]
+    sentence_content_tokens = [_count_unit_tokens(token_counter, sentence_text) for sentence_text in sentence_slices]
+    sentence_word_counts = [count_words(sentence_text) for sentence_text in sentence_slices]
+
+    def _build_prefixes(values: Sequence[int]) -> list[int]:
+        prefixes = [0]
+        for value in values:
+            prefixes.append(prefixes[-1] + value)
+        return prefixes
+
+    sentence_content_token_prefixes = _build_prefixes(sentence_content_tokens)
+    sentence_word_prefixes = _build_prefixes(sentence_word_counts)
+
     if not sentences:
         # no sentences -> no chunks, no errors
         return [], []
@@ -892,12 +1106,28 @@ def build_chunks_for_document(
         if start_index < 0:
             start_index = 0
 
-        chunk_indices = _choose_chunk_indices(sentences, start_index, texto, config, token_counter)
+        chunk_indices = _choose_chunk_indices(
+            sentences,
+            start_index,
+            texto,
+            config,
+            token_counter,
+            sentence_content_token_prefixes,
+            sentence_word_prefixes,
+        )
         if not chunk_indices or chunk_indices[-1] < cursor:
             if overlap > 0:
                 overlap = _select_overlap(prev_chunk_sentences, overlap - 1)
                 start_index = cursor - overlap if overlap > 0 else cursor
-                chunk_indices = _choose_chunk_indices(sentences, start_index, texto, config, token_counter)
+                chunk_indices = _choose_chunk_indices(
+                    sentences,
+                    start_index,
+                    texto,
+                    config,
+                    token_counter,
+                    sentence_content_token_prefixes,
+                    sentence_word_prefixes,
+                )
 
         if not chunk_indices or chunk_indices[-1] < cursor:
             sentence = sentences[cursor]
@@ -914,7 +1144,23 @@ def build_chunks_for_document(
                         # fall back to whitespace-based splitting if no pairs found
                         new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
                     if new_sentences and len(new_sentences) > 1:
-                        sentences = sentences[:cursor] + new_sentences + sentences[cursor + 1 :]
+                        (
+                            sentences,
+                            sentence_content_tokens,
+                            sentence_word_counts,
+                            sentence_content_token_prefixes,
+                            sentence_word_prefixes,
+                        ) = _splice_sentences_and_update_stats(
+                            sentences,
+                            sentence_content_tokens,
+                            sentence_word_counts,
+                            sentence_content_token_prefixes,
+                            sentence_word_prefixes,
+                            cursor,
+                            new_sentences,
+                            texto,
+                            token_counter,
+                        )
                         tried_fallback = True
                         continue
 
@@ -958,13 +1204,72 @@ def build_chunks_for_document(
         chunk_start = sentences[chunk_indices[0]].char_start
         chunk_end = sentences[chunk_indices[-1]].char_end
         chunk_text = texto[chunk_start:chunk_end]
+        while chunk_indices and not _chunk_meets_limits(chunk_text, config, token_counter):
+            if len(chunk_indices) == 1:
+                sentence = sentences[chunk_indices[0]]
+                if _is_oversize_sentence(sentence, texto, config, token_counter):
+                    fragment_text = texto[sentence.char_start:sentence.char_end]
+                    fmt = record.get("formato", "").lower()
+                    if fmt in STRUCTURED_FORMATS:
+                        new_sentences = _split_structured_pairs(sentence, texto, config, token_counter)
+                        if not new_sentences:
+                            new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
+                        if new_sentences and len(new_sentences) > 1:
+                            (
+                                sentences,
+                                sentence_content_tokens,
+                                sentence_word_counts,
+                                sentence_content_token_prefixes,
+                                sentence_word_prefixes,
+                            ) = _splice_sentences_and_update_stats(
+                                sentences,
+                                sentence_content_tokens,
+                                sentence_word_counts,
+                                sentence_content_token_prefixes,
+                                sentence_word_prefixes,
+                                chunk_indices[0],
+                                new_sentences,
+                                texto,
+                                token_counter,
+                            )
+                            continue
+                    fragment_tokens = token_counter.count(fragment_text)
+                    fragment_words = count_words(fragment_text)
+                    error = ErrorRecord(
+                        line_number=line_number,
+                        doc_id=doc_id,
+                        fuente=record["fuente"],
+                        idioma=record["idioma"],
+                        char_start=sentence.char_start,
+                        char_end=sentence.char_end,
+                        num_tokens=fragment_tokens,
+                        num_palabras=fragment_words,
+                        max_tokens=config.max_tokens,
+                        max_words=config.max_words,
+                        motivo="oración oversize",
+                    )
+                    if config.on_oversize == "fail":
+                        raise FatalChunkingError(
+                            f"L{line_number}: oración oversize en documento {doc_id}."
+                        )
+                    errors.append(error)
+                    if warnings_out is not None:
+                        warnings_out.extend(warnings)
+                    return [], errors
+                raise FatalChunkingError(
+                    f"L{line_number}: chunk generado excede límites para documento {doc_id}."
+                )
+            chunk_indices = chunk_indices[:-1]
+            if not chunk_indices:
+                raise FatalChunkingError(
+                    f"L{line_number}: no se pudo construir chunk válido para documento {doc_id}."
+                )
+            chunk_start = sentences[chunk_indices[0]].char_start
+            chunk_end = sentences[chunk_indices[-1]].char_end
+            chunk_text = texto[chunk_start:chunk_end]
+
         num_tokens = token_counter.count(chunk_text)
         num_palabras = count_words(chunk_text)
-
-        if num_tokens > config.max_tokens or num_palabras > config.max_words:
-            raise FatalChunkingError(
-                f"L{line_number}: chunk generado excede límites para documento {doc_id}."
-            )
 
         chunk_id = _chunk_id_for(doc_id, position)
         chunk = ChunkRecord(
@@ -1016,7 +1321,10 @@ def build_chunks_for_document(
         cursor = chunk_indices[-1] + 1
         position += 1
 
-    _validate_chunk_sequence(chunks, texto, config)
+    try:
+        _validate_chunk_sequence(chunks, texto, config)
+    except FatalChunkingError as exc:
+        raise FatalChunkingError(f"L{line_number} doc_id={doc_id}: {exc}") from exc
     # propagate warnings to caller if requested (backwards-compatible)
     if warnings_out is not None:
         warnings_out.extend(warnings)
