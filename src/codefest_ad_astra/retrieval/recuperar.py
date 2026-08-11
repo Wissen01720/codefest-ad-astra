@@ -1,45 +1,26 @@
-"""Fase 6 — recuperación, sin depender de un Buscador (no existe en el código real)."""
+"""Fase 6 — recuperación a nivel de documento sobre una base vectorial ya
+construida en la Fase 4.
+
+Reutiliza `Buscador` (`indexing.search`) para la parte de índice → chunks: es
+la única implementación que lee el modelo, la dimensión y los prefijos de
+consulta/pasaje desde `manifest.json` en vez de asumirlos, así que aquí no se
+duplica esa lógica ni se corre el riesgo de que diverja (spec 8.1: la consulta
+debe codificarse con el mismo encoder y los mismos prefijos con que se
+construyó el índice). Este módulo solo añade lo propio de la Fase 6: agregar
+los top-k chunks recuperados a nivel de documento.
+"""
 from __future__ import annotations
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-import faiss
-
-from ..indexing.encoder import load_encoder, encode_texts
+from ..indexing.search import Buscador, Resultado
 
 DEFAULT_TOP_DOCUMENTOS = 3
 DEFAULT_K_CHUNKS = 20
 
-
-@dataclass(slots=True)
-class ResultadoChunk:
-    rank: int
-    score: float
-    metadata: dict[str, Any]
-
-
-def cargar_base(carpeta: Path):
-    indice = faiss.read_index(str(carpeta / "index.faiss"))
-    metadata = []
-    with open(carpeta / "metadata.jsonl", encoding="utf-8") as f:
-        for linea in f:
-            if linea.strip():
-                metadata.append(json.loads(linea))
-    if indice.ntotal != len(metadata):
-        raise RuntimeError(f"Desalineación: índice={indice.ntotal}, metadata={len(metadata)}")
-    return indice, metadata
-
-
-def buscar(indice, metadata, modelo, consulta: str, k: int) -> list[ResultadoChunk]:
-    vector = encode_texts(modelo, [consulta], batch_size=1)
-    scores, ids = indice.search(vector, k)
-    return [
-        ResultadoChunk(rank=r, score=float(s), metadata=metadata[i])
-        for r, (i, s) in enumerate(zip(ids[0], scores[0]), start=1)
-        if i != -1
-    ]
+# Alias para quien ya importaba ResultadoChunk desde este módulo.
+ResultadoChunk = Resultado
 
 
 @dataclass(slots=True)
@@ -49,10 +30,12 @@ class DocumentoRecuperado:
     fuente: str
     formato: str
     fenomeno: int
-    chunks: list[ResultadoChunk] = field(default_factory=list)
+    chunks: list[Resultado] = field(default_factory=list)
 
 
-def agregar_a_documentos(resultados, top_documentos=DEFAULT_TOP_DOCUMENTOS):
+def agregar_a_documentos(
+    resultados: list[Resultado], top_documentos: int = DEFAULT_TOP_DOCUMENTOS
+) -> list[DocumentoRecuperado]:
     por_doc: dict[str, DocumentoRecuperado] = {}
     for r in resultados:
         doc_id = r.metadata["doc_id"]
@@ -69,9 +52,24 @@ def agregar_a_documentos(resultados, top_documentos=DEFAULT_TOP_DOCUMENTOS):
     return sorted(por_doc.values(), key=lambda d: d.score, reverse=True)[:top_documentos]
 
 
-def recuperar_documentos(carpeta_base: Path, consulta: str, *, modelo_nombre="BAAI/bge-m3",
-                          k_chunks=DEFAULT_K_CHUNKS, top_documentos=DEFAULT_TOP_DOCUMENTOS):
-    indice, metadata = cargar_base(carpeta_base)
-    modelo = load_encoder(modelo_nombre)
-    resultados = buscar(indice, metadata, modelo, consulta, k_chunks)
+def recuperar_documentos(
+    carpeta_base: Path,
+    consulta: str,
+    *,
+    buscador: Buscador | None = None,
+    device: str | None = None,
+    k_chunks: int = DEFAULT_K_CHUNKS,
+    top_documentos: int = DEFAULT_TOP_DOCUMENTOS,
+) -> list[DocumentoRecuperado]:
+    """Busca `consulta`, recupera hasta `k_chunks` fragmentos y los agrega a
+    los `top_documentos` documentos con mayor score acumulado.
+
+    `buscador` se puede pasar ya construido (para no recargar el encoder en
+    cada consulta, p. ej. en un bucle o servidor); si no se pasa, se construye
+    uno nuevo a partir de `carpeta_base`, leyendo modelo/dimensión/prefijos
+    de su `manifest.json` — nunca se asume un modelo por defecto aquí.
+    """
+    if buscador is None:
+        buscador = Buscador(carpeta_base, device=device)
+    resultados = buscador.buscar(consulta, k=k_chunks)
     return agregar_a_documentos(resultados, top_documentos)
