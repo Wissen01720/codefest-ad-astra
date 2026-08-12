@@ -17,6 +17,16 @@ from codefest_ad_astra.ingest.chunking import (
 )
 
 
+class AlwaysOversizeTokenCounter:
+    """See tests/test_chunking.py for rationale: stands in for a genuinely
+    unrecoverable oversize case (not even 1 character fits) now that the
+    whitespace fallback can hard-split ordinary prose down to individual
+    characters and rescue almost anything regardless of formato."""
+
+    def count(self, text: str) -> int:
+        return 10_000 if text else 0
+
+
 def write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
 
@@ -221,6 +231,10 @@ def test_create_transformer_token_counter_uses_offline_flag(monkeypatch) -> None
 
 
 def test_on_oversize_fail_returns_one(tmp_path: Path) -> None:
+    """Uses AlwaysOversizeTokenCounter (not FakeTokenCounter) so the
+    document is genuinely unrecoverable — the fallback extension means
+    ordinary prose with FakeTokenCounter no longer triggers 'fail' at all,
+    but the policy itself must still raise when nothing can help."""
     input_path = tmp_path / "corpus.jsonl"
     write_jsonl(input_path, [
         {
@@ -247,12 +261,15 @@ def test_on_oversize_fail_returns_one(tmp_path: Path) -> None:
     )
 
     with pytest.raises(Exception):
-        process_chunking(config, token_counter_factory=lambda _: FakeTokenCounter())
+        process_chunking(config, token_counter_factory=lambda _: AlwaysOversizeTokenCounter())
     assert not output_path.exists()
     assert not error_path.exists()
 
 
 def test_on_oversize_skip_document_writes_error(tmp_path: Path) -> None:
+    """Same rationale as test_on_oversize_fail_returns_one above: uses
+    AlwaysOversizeTokenCounter to keep testing the skip-document + error-file
+    mechanism with a genuinely unrecoverable document."""
     input_path = tmp_path / "corpus.jsonl"
     write_jsonl(input_path, [
         {
@@ -278,7 +295,7 @@ def test_on_oversize_skip_document_writes_error(tmp_path: Path) -> None:
         on_oversize="skip-document",
     )
 
-    assert process_chunking(config, token_counter_factory=lambda _: FakeTokenCounter()) == 0
+    assert process_chunking(config, token_counter_factory=lambda _: AlwaysOversizeTokenCounter()) == 0
     assert output_path.exists()
     assert error_path.exists()
     assert output_path.read_text(encoding="utf-8").strip() == ""
@@ -428,6 +445,10 @@ def test_output_directories_are_created(tmp_path: Path) -> None:
 
 
 def test_previous_valid_output_preserved_on_failure(tmp_path: Path) -> None:
+    """Uses AlwaysOversizeTokenCounter for the same reason as the two
+    on_oversize tests above: needs a genuinely unrecoverable document so
+    on_oversize='fail' actually raises and exercises the 'don't clobber the
+    previous good output' guarantee this test protects."""
     output_path = tmp_path / "chunks.jsonl"
     error_path = tmp_path / "errors.jsonl"
     output_path.write_text('{"existing": true}\n', encoding="utf-8")
@@ -457,7 +478,7 @@ def test_previous_valid_output_preserved_on_failure(tmp_path: Path) -> None:
     )
 
     with pytest.raises(Exception):
-        process_chunking(config, token_counter_factory=lambda _: FakeTokenCounter())
+        process_chunking(config, token_counter_factory=lambda _: AlwaysOversizeTokenCounter())
 
     assert output_path.read_text(encoding="utf-8") == '{"existing": true}\n'
     assert error_path.read_text(encoding="utf-8") == '{"existing": true}\n'

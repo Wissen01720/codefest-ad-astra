@@ -20,6 +20,16 @@ class WeirdTokenCounter(FakeTokenCounter):
         return max(1, len(text) // 10)
 
 
+class AlwaysOversizeTokenCounter:
+    """See tests/test_chunking.py for rationale: a genuinely unrecoverable
+    counter (not even 1 character fits), used to keep testing on_oversize
+    handling now that pdf/txt also get the whitespace fallback and ordinary
+    prose no longer triggers it."""
+
+    def count(self, text: str) -> int:
+        return 10_000 if text else 0
+
+
 def test_structured_pair_split_keeps_pairs():
     text = "ciudad: Bogotá D.C. poblacion: 7000000 area_km2: 1587"
     record = {
@@ -54,13 +64,33 @@ def test_structured_pair_split_keeps_pairs():
     assert reconstructed == text
 
 
-def test_pdf_no_fallback_oversize_raises():
-    # long sentence without punctuation in pdf should not fallback
-    text = "palabra " * 600
+def test_pdf_fallback_now_recovers_oversize_sentence_with_normal_words():
+    """As of the fallback extension (recovered 264 real pdf documents that
+    used to be skip-document'd), pdf format DOES get the whitespace fallback
+    now — it's no longer gated to csv/xlsx/pbf. Ordinary space-separated
+    prose, even without any terminal punctuation, is recovered."""
+    text = " ".join(["palabra"] * 600)
     record = {"doc_id": "doc_pdf", "fuente": "f", "formato": "pdf", "fenomeno": 1, "idioma": "es", "texto": text}
     config = ChunkingConfig(input_path=Path("in"), output_path=Path("out"), error_path=Path("err"), tokenizer_model="fake", max_tokens=100, max_words=50, overlap_sentences=0, on_oversize="fail")
+    chunks, errors = build_chunks_for_document(1, record, config, FakeTokenCounter())
+    assert errors == []
+    assert chunks
+    assert all(c.num_tokens <= config.max_tokens and c.num_palabras <= config.max_words for c in chunks)
+    reconstructed = "".join(c.texto for c in chunks)
+    assert reconstructed == text
+
+
+def test_pdf_truly_unrecoverable_oversize_still_raises():
+    """Companion to the test above: pdf content that genuinely can't be
+    reduced (not even to 1 character — think a source with a corrupted or
+    undecodable encoding, like a PDF with CID glyphs and no ToUnicode map,
+    the real case that stayed skip-document'd in production) must still
+    raise under on_oversize='fail'."""
+    text = "palabra " * 600
+    record = {"doc_id": "doc_pdf_bad", "fuente": "f", "formato": "pdf", "fenomeno": 1, "idioma": "es", "texto": text}
+    config = ChunkingConfig(input_path=Path("in"), output_path=Path("out"), error_path=Path("err"), tokenizer_model="fake", max_tokens=100, max_words=50, overlap_sentences=0, on_oversize="fail")
     with pytest.raises(FatalChunkingError):
-        build_chunks_for_document(1, record, config, FakeTokenCounter())
+        build_chunks_for_document(1, record, config, AlwaysOversizeTokenCounter())
 
 
 def test_pathological_single_pair_hard_split():
@@ -113,7 +143,10 @@ def test_overlap_with_fallback_chunks():
 
 
 def test_pdf_skip_document_writes_error_file(tmp_path):
-    # Long no-punct sentence in pdf should not be split; skip-document writes an error
+    """Uses AlwaysOversizeTokenCounter to keep testing the skip-document +
+    error-file mechanism for pdf with a genuinely unrecoverable document —
+    ordinary prose (the old fixture) is now recovered via fallback instead
+    of skipped, see test_pdf_fallback_now_recovers_oversize_sentence_with_normal_words."""
     text = "palabra " * 600
     record = {"doc_id": "doc_pdf", "fuente": "f", "formato": "pdf", "fenomeno": 1, "idioma": "es", "texto": text}
     input_path = tmp_path / "in.jsonl"
@@ -121,9 +154,8 @@ def test_pdf_skip_document_writes_error_file(tmp_path):
     err_path = tmp_path / "err.jsonl"
     input_path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
     config = ChunkingConfig(input_path=input_path, output_path=out_path, error_path=err_path, tokenizer_model="fake", max_tokens=100, max_words=50, overlap_sentences=0, on_oversize="skip-document")
-    # run processing with FakeTokenCounter via factory
-    exit_code = process_chunking(config, token_counter_factory=lambda _: FakeTokenCounter())
-    # output file should exist (may be empty if skipped), error file must contain entry
+    exit_code = process_chunking(config, token_counter_factory=lambda _: AlwaysOversizeTokenCounter())
+    assert exit_code == 0
     assert err_path.exists()
     contents = err_path.read_text(encoding="utf-8")
     assert "oración oversize" in contents or "oraci" in contents

@@ -9,4 +9,4 @@ data/raw/fenomeno_1/
 # base_vectorial/ contiene index.faiss (entregable real) -- se ignora aqui
 # por directorio, no via *.faiss, para no depender de esa regla generica.
 base_vectorial/
-data/processed/
+data/processed/entrega/base_vectorial/

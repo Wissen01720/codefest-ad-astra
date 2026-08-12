@@ -513,6 +513,46 @@ def _is_oversize_sentence(sentence: Sentence, original_text: str, config: Chunki
     return token_counter.count(text) > config.max_tokens or count_words(text) > config.max_words
 
 
+def _reconcile_oversize_segments(
+    segments: list["Sentence"],
+    original_text: str,
+    config: "ChunkingConfig",
+    token_counter: "TokenCounter",
+) -> list["Sentence"]:
+    """Final safety pass shared by both fallbacks.
+
+    The greedy grouping in `_split_structured_pairs` / `_split_long_sentence_on_whitespace`
+    estimates each segment's size by summing PER-PIECE token counts (per pair
+    or per word) as it accumulates them. Real subword tokenizers are not
+    strictly additive — tokenizing pieces separately vs. jointly can differ by
+    a few tokens either way, especially right at a merge boundary — and
+    `_split_structured_pairs`'s colon-merge post-process compounds this by
+    concatenating two already-accepted segments without re-checking limits.
+    So the summed estimate can occasionally undershoot the real count of the
+    assembled segment text. Re-count each returned segment with the real
+    tokenizer on its ACTUAL text; if it's still oversize despite passing the
+    approximate check, hard-split it by characters as a last resort instead
+    of silently emitting a chunk that violates max_tokens/max_words.
+    """
+    reconciled: list[Sentence] = []
+    for seg in segments:
+        seg_text = original_text[seg.char_start:seg.char_end]
+        if token_counter.count(seg_text) <= config.max_tokens and count_words(seg_text) <= config.max_words:
+            reconciled.append(seg)
+            continue
+        hard_segments = _hard_split_by_chars(
+            seg_text, seg.block_index, seg.is_heading, seg.char_start, config, token_counter,
+        )
+        if not hard_segments:
+            # Couldn't even hard-split (a single character alone exceeds the
+            # limit) — keep the segment as-is; the caller's own oversize
+            # handling downstream will catch and report it.
+            reconciled.append(seg)
+            continue
+        reconciled.extend(hard_segments)
+    return reconciled
+
+
 def _split_long_sentence_on_whitespace(
     sentence: Sentence,
     original_text: str,
@@ -549,9 +589,24 @@ def _split_long_sentence_on_whitespace(
         seg_tokens = word_prefixes[i + 1] - word_prefixes[seg_start]
         if seg_tokens > config.max_tokens or seg_words > config.max_words:
             # if adding the current word breaks the limits and the segment
-            # would be empty (single word), we cannot split safely
+            # would be empty (single word), hard-split that one word by
+            # characters instead of giving up: PDF extraction commonly
+            # produces a single unbroken run (a concatenated table cell, a
+            # URL, a hash) that alone exceeds max_tokens. _hard_split_by_chars
+            # is the same helper already used for oversize structured pairs.
             if seg_start == i:
-                return []
+                word_char_start = sentence.char_start + words[i][1]
+                word_text = text[words[i][1]:words[i][2]]
+                hard_segments = _hard_split_by_chars(
+                    word_text, sentence.block_index, sentence.is_heading,
+                    word_char_start, config, token_counter,
+                )
+                if not hard_segments:
+                    return []
+                segments.extend(hard_segments)
+                seg_start = i + 1
+                i += 1
+                continue
             # finalize previous segment (end at start of current word to
             # include the whitespace separator)
             prev_end = words[i][1]
@@ -601,7 +656,7 @@ def _split_long_sentence_on_whitespace(
             )
         )
 
-    return segments
+    return _reconcile_oversize_segments(segments, original_text, config, token_counter)
 
 
 def _split_structured_pairs(
@@ -842,7 +897,7 @@ def _split_structured_pairs(
             merged.append(seg)
             i += 1
 
-    return merged
+    return _reconcile_oversize_segments(merged, original_text, config, token_counter)
 
 
 def _find_max_fit(
@@ -866,10 +921,23 @@ def _find_max_fit(
     while hi <= n and fits(hi):
         lo = hi
         hi = start + (hi - start) * 2
+    # The doubling loop above can exit for two different reasons, and only
+    # one of them means "we found the true boundary":
+    #   (a) fits(hi) was False — hi is a confirmed non-fitting length, safe
+    #       upper bound for the binary search below.
+    #   (b) hi > n — the doubling overshot the end of the text before fits()
+    #       ever failed. This does NOT mean the remaining text (start..n)
+    #       fits: it only means fits(lo) was confirmed for some lo < n. The
+    #       previous version of this function returned `n` directly in this
+    #       case without ever calling fits(n), which silently accepted
+    #       oversize segments whenever a hard-split boundary landed close
+    #       enough to the end of the text — exactly the failure mode that
+    #       let 455-473 token CSV segments (just over max_tokens=450) through
+    #       as a single unsplit "hard-split" segment.
+    # Clamping hi to at most n+1 and always binary-searching (instead of
+    # short-circuiting on case (b)) makes both cases correct: fits() gets
+    # tested for every candidate boundary up to and including n.
     hi = min(hi, n + 1)
-
-    if hi > n:
-        return n
 
     while lo + 1 < hi:
         mid = (lo + hi) // 2
@@ -1133,36 +1201,40 @@ def build_chunks_for_document(
             sentence = sentences[cursor]
             if _is_oversize_sentence(sentence, texto, config, token_counter):
                 fragment_text = texto[sentence.char_start:sentence.char_end]
-                # Only attempt structured fallback for known structured formats
+                # Structured pair-aware splitting only makes sense for
+                # key/value-shaped formats; for everything else (pdf, json,
+                # txt...) go straight to the generic whitespace fallback so
+                # those formats aren't skip-document'd without even trying.
                 fmt = record.get("formato", "").lower()
                 tried_fallback = False
-                # For structured formats we allow fallback even if values contain punctuation.
-                if fmt in STRUCTURED_FORMATS:
-                    # try structured pair-aware splitting first (structured formats)
-                    new_sentences = _split_structured_pairs(sentence, texto, config, token_counter)
-                    if not new_sentences:
-                        # fall back to whitespace-based splitting if no pairs found
-                        new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
-                    if new_sentences and len(new_sentences) > 1:
-                        (
-                            sentences,
-                            sentence_content_tokens,
-                            sentence_word_counts,
-                            sentence_content_token_prefixes,
-                            sentence_word_prefixes,
-                        ) = _splice_sentences_and_update_stats(
-                            sentences,
-                            sentence_content_tokens,
-                            sentence_word_counts,
-                            sentence_content_token_prefixes,
-                            sentence_word_prefixes,
-                            cursor,
-                            new_sentences,
-                            texto,
-                            token_counter,
-                        )
-                        tried_fallback = True
-                        continue
+                new_sentences = (
+                    _split_structured_pairs(sentence, texto, config, token_counter)
+                    if fmt in STRUCTURED_FORMATS
+                    else []
+                )
+                if not new_sentences:
+                    # fall back to whitespace-based splitting if no pairs found
+                    new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
+                if new_sentences and len(new_sentences) > 1:
+                    (
+                        sentences,
+                        sentence_content_tokens,
+                        sentence_word_counts,
+                        sentence_content_token_prefixes,
+                        sentence_word_prefixes,
+                    ) = _splice_sentences_and_update_stats(
+                        sentences,
+                        sentence_content_tokens,
+                        sentence_word_counts,
+                        sentence_content_token_prefixes,
+                        sentence_word_prefixes,
+                        cursor,
+                        new_sentences,
+                        texto,
+                        token_counter,
+                    )
+                    tried_fallback = True
+                    continue
 
                 # if we reached here, fallback was not applicable or failed
                 fragment_tokens = token_counter.count(fragment_text)
@@ -1210,29 +1282,32 @@ def build_chunks_for_document(
                 if _is_oversize_sentence(sentence, texto, config, token_counter):
                     fragment_text = texto[sentence.char_start:sentence.char_end]
                     fmt = record.get("formato", "").lower()
-                    if fmt in STRUCTURED_FORMATS:
-                        new_sentences = _split_structured_pairs(sentence, texto, config, token_counter)
-                        if not new_sentences:
-                            new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
-                        if new_sentences and len(new_sentences) > 1:
-                            (
-                                sentences,
-                                sentence_content_tokens,
-                                sentence_word_counts,
-                                sentence_content_token_prefixes,
-                                sentence_word_prefixes,
-                            ) = _splice_sentences_and_update_stats(
-                                sentences,
-                                sentence_content_tokens,
-                                sentence_word_counts,
-                                sentence_content_token_prefixes,
-                                sentence_word_prefixes,
-                                chunk_indices[0],
-                                new_sentences,
-                                texto,
-                                token_counter,
-                            )
-                            continue
+                    new_sentences = (
+                        _split_structured_pairs(sentence, texto, config, token_counter)
+                        if fmt in STRUCTURED_FORMATS
+                        else []
+                    )
+                    if not new_sentences:
+                        new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
+                    if new_sentences and len(new_sentences) > 1:
+                        (
+                            sentences,
+                            sentence_content_tokens,
+                            sentence_word_counts,
+                            sentence_content_token_prefixes,
+                            sentence_word_prefixes,
+                        ) = _splice_sentences_and_update_stats(
+                            sentences,
+                            sentence_content_tokens,
+                            sentence_word_counts,
+                            sentence_content_token_prefixes,
+                            sentence_word_prefixes,
+                            chunk_indices[0],
+                            new_sentences,
+                            texto,
+                            token_counter,
+                        )
+                        continue
                     fragment_tokens = token_counter.count(fragment_text)
                     fragment_words = count_words(fragment_text)
                     error = ErrorRecord(

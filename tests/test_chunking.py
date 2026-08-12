@@ -20,6 +20,20 @@ class TokenCounterByLength:
         return len(text)
 
 
+class AlwaysOversizeTokenCounter:
+    """Reports every non-empty text — even a single character — as exceeding
+    any realistic limit. Stands in for a genuinely unrecoverable case (e.g. a
+    source whose content can't be tokenized at all) now that the whitespace
+    fallback can hard-split ordinary text down to individual characters and
+    rescue almost anything. Used to keep testing the on_oversize policy
+    mechanism itself (fail / skip-document) without relying on a format gate
+    that no longer exists.
+    """
+
+    def count(self, text: str) -> int:
+        return 10_000 if text else 0
+
+
 def make_config(**overrides) -> ChunkingConfig:
     config = ChunkingConfig(
         input_path=Path("input.jsonl"),
@@ -81,7 +95,13 @@ def test_build_chunks_for_document_creates_overlapping_chunks() -> None:
     assert chunks[1].texto.strip() == "Segunda oración. Tercera oración."
 
 
-def test_build_chunks_for_document_reports_oversize_sentence_on_skip_document() -> None:
+def test_build_chunks_for_document_recovers_oversize_sentence_via_whitespace_fallback() -> None:
+    """As of the fallback extension, a plain-prose oversize sentence (no
+    key/value structure, just ordinary whitespace-separated words) is
+    recovered via `_split_long_sentence_on_whitespace` regardless of
+    `formato` — it no longer needs to be skipped just because the source
+    isn't csv/xlsx/pbf. This directly covers the change that recovered 281
+    previously skip-document'd real documents (mostly pdf/json/txt)."""
     record = {
         "doc_id": "doc2",
         "fuente": "fuente",
@@ -103,11 +123,11 @@ def test_build_chunks_for_document_reports_oversize_sentence_on_skip_document() 
 
     chunks, errors = build_chunks_for_document(1, record, config, FakeTokenCounter())
 
-    assert chunks == []
-    assert len(errors) == 1
-    assert errors[0].motivo == "oración oversize"
-    assert errors[0].doc_id == "doc2"
-    assert errors[0].num_palabras > config.max_words
+    assert not errors
+    assert chunks
+    assert all(c.num_palabras <= config.max_words and c.num_tokens <= config.max_tokens for c in chunks)
+    reconstructed = "".join(c.texto for c in chunks)
+    assert reconstructed == record["texto"]
 
 
 def test_build_chunks_for_document_preserves_unlisted_formato_and_idioma() -> None:
@@ -213,7 +233,10 @@ def test_build_chunks_for_document_deterministic_ids() -> None:
     assert [chunk.posicion for chunk in chunks1] == [chunk.posicion for chunk in chunks2]
 
 
-def test_build_chunks_for_document_skip_document_oversize() -> None:
+def test_build_chunks_for_document_skip_document_oversize_still_works_when_truly_unrecoverable() -> None:
+    """The skip-document path itself (an oversize sentence that genuinely
+    can't be reduced — not even to a single character) is still exercised
+    and must still produce an empty chunk list plus one error record."""
     record = {
         "doc_id": "doc_skip",
         "fuente": "fuente",
@@ -224,7 +247,7 @@ def test_build_chunks_for_document_skip_document_oversize() -> None:
     }
     config = make_config(max_tokens=1, max_words=1, on_oversize="skip-document")
 
-    chunks, errors = build_chunks_for_document(1, record, config, FakeTokenCounter())
+    chunks, errors = build_chunks_for_document(1, record, config, AlwaysOversizeTokenCounter())
     assert chunks == []
     assert len(errors) == 1
     assert errors[0].motivo == "oración oversize"
@@ -291,7 +314,11 @@ def test_build_chunks_for_document_preserves_headers_lists_and_bullets() -> None
     assert chunks[0].texto == record["texto"][chunks[0].char_start:chunks[0].char_end]
 
 
-def test_build_chunks_for_document_oversize_by_tokens_and_words() -> None:
+def test_build_chunks_for_document_oversize_recovers_regardless_of_format_or_policy() -> None:
+    """With a real (character-length-based) token counter and ordinary
+    prose, the fallback now recovers the document under every combination
+    of max_tokens/max_words pressure and on_oversize policy — 'fail' never
+    even needs to trigger because the fallback always succeeds first."""
     record = {
         "doc_id": "doc_oversize",
         "fuente": "fuente",
@@ -301,21 +328,44 @@ def test_build_chunks_for_document_oversize_by_tokens_and_words() -> None:
         "texto": "Una oración muy larga que cuenta como muchos tokens y muchas palabras.",
     }
 
-    for max_tokens, max_words, on_oversize, should_fail in [
-        (1, 100, "fail", True),
-        (100, 1, "fail", True),
-        (1, 100, "skip-document", False),
-        (100, 1, "skip-document", False),
+    for max_tokens, max_words, on_oversize in [
+        (1, 100, "fail"),
+        (100, 1, "fail"),
+        (1, 100, "skip-document"),
+        (100, 1, "skip-document"),
     ]:
         config = make_config(max_tokens=max_tokens, max_words=max_words, on_oversize=on_oversize)
-        if should_fail:
-            with pytest.raises(Exception):
-                build_chunks_for_document(1, record, config, TokenCounterByLength())
-        else:
-            chunks, errors = build_chunks_for_document(1, record, config, TokenCounterByLength())
-            assert chunks == []
-            assert len(errors) == 1
-            assert errors[0].motivo == "oración oversize"
+        chunks, errors = build_chunks_for_document(1, record, config, TokenCounterByLength())
+        assert not errors
+        assert chunks
+        reconstructed = "".join(c.texto for c in chunks)
+        assert reconstructed == record["texto"]
+
+
+def test_build_chunks_for_document_truly_unrecoverable_oversize_respects_on_oversize_policy() -> None:
+    """Companion to the test above: when nothing — not even a single
+    character — can satisfy the limit, 'fail' must still raise and
+    'skip-document' must still cleanly skip. The fallback extension makes
+    this much harder to hit for ordinary text, but the safety net itself is
+    unchanged."""
+    record = {
+        "doc_id": "doc_unrecoverable",
+        "fuente": "fuente",
+        "formato": "txt",
+        "fenomeno": 1,
+        "idioma": "es",
+        "texto": "Cualquier texto, no importa cuál.",
+    }
+
+    fail_config = make_config(max_tokens=1, max_words=1000, on_oversize="fail")
+    with pytest.raises(Exception):
+        build_chunks_for_document(1, record, fail_config, AlwaysOversizeTokenCounter())
+
+    skip_config = make_config(max_tokens=1, max_words=1000, on_oversize="skip-document")
+    chunks, errors = build_chunks_for_document(1, record, skip_config, AlwaysOversizeTokenCounter())
+    assert chunks == []
+    assert len(errors) == 1
+    assert errors[0].motivo == "oración oversize"
 
 
 def test_process_chunking_multiple_documents_preserve_order_and_chunk_ids(tmp_path: Path) -> None:
@@ -403,6 +453,11 @@ def test_process_chunking_failure_removes_temporary_files(tmp_path: Path, monkey
 
 
 def test_process_chunking_writes_output_and_error_files(tmp_path: Path) -> None:
+    """As of the fallback extension, doc2 (formato='html', an oversize
+    sentence inside a list block) is now recovered via the whitespace
+    fallback instead of being skip-document'd — it used to be the one
+    document in this fixture that produced an 'oración oversize' error.
+    All 3 documents now succeed with no errors."""
     source_fixture = Path(__file__).resolve().parent / "fixtures" / "mini_corpus.jsonl"
     input_path = tmp_path / "mini_corpus.jsonl"
     output_path = tmp_path / "chunks.jsonl"
@@ -427,20 +482,14 @@ def test_process_chunking_writes_output_and_error_files(tmp_path: Path) -> None:
     chunks = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line]
     errors = [json.loads(line) for line in error_path.read_text(encoding="utf-8").splitlines() if line]
 
-    assert len(chunks) == 3
-    assert [chunk["doc_id"] for chunk in chunks] == ["doc1", "doc1", "doc3"]
-    assert errors == [
-        {
-            "line_number": 2,
-            "doc_id": "doc2",
-            "fuente": "fuente",
-            "idioma": "en",
-            "char_start": 41,
-            "char_end": 85,
-            "num_tokens": 11,
-            "num_palabras": 11,
-            "max_tokens": 10,
-            "max_words": 10,
-            "motivo": "oración oversize",
-        }
+    assert not errors
+    assert len(chunks) == 6
+    assert [chunk["doc_id"] for chunk in chunks] == ["doc1", "doc1", "doc2", "doc2", "doc2", "doc3"]
+    assert [chunk["chunk_id"] for chunk in chunks if chunk["doc_id"] == "doc2"] == [
+        "doc2-chunk-0000",
+        "doc2-chunk-0001",
+        "doc2-chunk-0002",
     ]
+    for chunk in chunks:
+        assert chunk["num_tokens"] <= config.max_tokens
+        assert chunk["num_palabras"] <= config.max_words
