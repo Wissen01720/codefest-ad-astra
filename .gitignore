@@ -10,3 +10,5 @@ data/raw/fenomeno_1/
 # por directorio, no via *.faiss, para no depender de esa regla generica.
 base_vectorial/
 data/processed/entrega/base_vectorial/
+entrega/base_vectorial_bge-m3.tar.gz
+data/processed/
