@@ -4,3 +4,11 @@ __pycache__/
 .env
 data/raw_muestra/
 data/raw/fenomeno_1/
+
+# Salida generada por el pipeline (Fase 3/4): no es fuente, se regenera.
+# base_vectorial/ contiene index.faiss (entregable real) -- se ignora aqui
+# por directorio, no via *.faiss, para no depender de esa regla generica.
+base_vectorial/
+data/processed/entrega/base_vectorial/
+entrega/base_vectorial_bge-m3.tar.gz
+data/processed/
