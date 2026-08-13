@@ -64,20 +64,14 @@ def test_structured_pair_split_keeps_pairs():
     assert reconstructed == text
 
 
-def test_pdf_fallback_now_recovers_oversize_sentence_with_normal_words():
-    """As of the fallback extension (recovered 264 real pdf documents that
-    used to be skip-document'd), pdf format DOES get the whitespace fallback
-    now — it's no longer gated to csv/xlsx/pbf. Ordinary space-separated
-    prose, even without any terminal punctuation, is recovered."""
+def test_pdf_oversize_sentence_is_not_split_by_words():
+    """Prose cannot use the whitespace fallback: doing so would violate the
+    mandatory complete-sentence boundary from section 3.3."""
     text = " ".join(["palabra"] * 600)
     record = {"doc_id": "doc_pdf", "fuente": "f", "formato": "pdf", "fenomeno": 1, "idioma": "es", "texto": text}
     config = ChunkingConfig(input_path=Path("in"), output_path=Path("out"), error_path=Path("err"), tokenizer_model="fake", max_tokens=100, max_words=50, overlap_sentences=0, on_oversize="fail")
-    chunks, errors = build_chunks_for_document(1, record, config, FakeTokenCounter())
-    assert errors == []
-    assert chunks
-    assert all(c.num_tokens <= config.max_tokens and c.num_palabras <= config.max_words for c in chunks)
-    reconstructed = "".join(c.texto for c in chunks)
-    assert reconstructed == text
+    with pytest.raises(FatalChunkingError):
+        build_chunks_for_document(1, record, config, FakeTokenCounter())
 
 
 def test_pdf_truly_unrecoverable_oversize_still_raises():

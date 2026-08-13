@@ -24,7 +24,8 @@ from sentence_transformers import SentenceTransformer
 MAX_DOCUMENTOS = 3
 MAX_FRAGMENTOS = 10
 MAX_PALABRAS = 250
-_FIN_ORACION_RE = re.compile(r"(?<=[.!?])\s+")
+_FIN_ORACION_RE = re.compile(r"[.!?…](?=[\]\)\}\"'»”’]*(?:\s|$))")
+_PRIMERA_LETRA_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
 
 
 def _normalizar(vectores: np.ndarray) -> np.ndarray:
@@ -34,17 +35,33 @@ def _normalizar(vectores: np.ndarray) -> np.ndarray:
 
 
 def _texto_completo(texto: str, max_palabras: int = MAX_PALABRAS) -> str | None:
-    if len(texto.split()) <= max_palabras:
-        return texto
-    acumuladas: list[str] = []
-    total = 0
-    for oracion in _FIN_ORACION_RE.split(texto):
-        cantidad = len(oracion.split())
-        if total + cantidad > max_palabras:
+    """Devuelve el prefijo más largo que acaba en una oración completa.
+
+    Además del límite de palabras, esto elimina restos de la siguiente
+    oración que hayan quedado al final de un chunk del índice. La sección
+    9.2.1 permite reportar un subfragmento conservando el ``chunk_id``.
+    """
+    ultimo_fin: int | None = None
+    for coincidencia in _FIN_ORACION_RE.finditer(texto):
+        candidato = texto[:coincidencia.end()].strip()
+        if len(candidato.split()) <= max_palabras:
+            ultimo_fin = coincidencia.end()
+        else:
             break
-        acumuladas.append(oracion)
-        total += cantidad
-    return " ".join(acumuladas) if acumuladas else None
+    if ultimo_fin is None:
+        return None
+    limpio = texto[:ultimo_fin].strip()
+    while True:
+        primera = _PRIMERA_LETRA_RE.search(limpio)
+        if primera is None or not primera.group().islower():
+            return limpio
+        fin_parcial = _FIN_ORACION_RE.search(limpio, primera.end())
+        if fin_parcial is None:
+            return limpio
+        restante = limpio[fin_parcial.end():].lstrip(" \t\r\n]})\"'»”’")
+        if not restante:
+            return limpio
+        limpio = restante
 
 
 def _leer_jsonl(path: Path) -> list[dict[str, Any]]:

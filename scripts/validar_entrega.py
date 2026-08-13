@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import faiss
-from pypdf import PdfReader
+import numpy as np
+import pdfplumber
 
 RAIZ = Path(__file__).resolve().parent.parent
 ENTREGA = RAIZ / "entrega"
@@ -22,6 +24,7 @@ CAMPOS_METADATA = {
 IMPORTS_GENERATIVOS = {
     "openai", "anthropic", "google.generativeai", "transformers.pipeline", "vllm", "llama_cpp"
 }
+_FIN_ORACION_RE = re.compile(r"[.!?…][\]\)\}\"'»”’]*$")
 
 
 def _leer_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -68,6 +71,8 @@ def validar_resultados() -> str:
             raise ValueError(f"{qid}: deben existir exactamente 3 documentos")
         if not isinstance(frags, list) or len(frags) != 10:
             raise ValueError(f"{qid}: deben existir exactamente 10 fragmentos")
+        if len({doc.get("doc_id") for doc in docs if isinstance(doc, dict)}) != 3:
+            raise ValueError(f"{qid}: los 3 documentos deben ser distintos")
         for rank, doc in enumerate(docs, start=1):
             if not isinstance(doc, dict) or set(doc) != {"rank", "doc_id"}:
                 raise ValueError(f"{qid}: documento {rank} tiene esquema inválido")
@@ -84,6 +89,8 @@ def validar_resultados() -> str:
                     raise ValueError(f"{qid}: fragmento {rank}, {campo} vacío o inválido")
             if len(frag["text"].split()) > 250:
                 raise ValueError(f"{qid}: fragmento {rank} supera 250 palabras")
+            if not _FIN_ORACION_RE.search(frag["text"].rstrip()):
+                raise ValueError(f"{qid}: fragmento {rank} no termina en una oración completa")
             if frag["chunk_id"] in ids:
                 raise ValueError(f"{qid}: chunk_id duplicado {frag['chunk_id']}")
             ids.add(frag["chunk_id"])
@@ -96,9 +103,30 @@ def validar_base(dir_encoder: Path) -> str:
     metadata_path = dir_encoder / "metadata.jsonl"
     if not indice_path.is_file() or not metadata_path.is_file():
         raise ValueError("faltan index.faiss o metadata.jsonl")
+    manifest_path = dir_encoder / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("falta manifest.json, necesario para reproducir el encoder")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     indice = faiss.read_index(str(indice_path))
     if indice.ntotal < 1:
         raise ValueError("el índice está vacío")
+    if type(indice).__name__ != "IndexFlatIP":
+        raise ValueError(f"tipo de índice inesperado: {type(indice).__name__}")
+    if manifest.get("indice_parcial"):
+        raise ValueError("manifest.json declara un índice parcial")
+    if manifest.get("dimension") != indice.d:
+        raise ValueError("dimensión de manifest.json distinta de index.faiss")
+
+    resultados = _leer_jsonl(ENTREGA / "resultados.jsonl")
+    chunks_salida = {
+        frag["chunk_id"]: (frag["doc_id"], frag["text"])
+        for resultado in resultados for frag in resultado["fragments"]
+    }
+    docs_salida = {
+        doc["doc_id"] for resultado in resultados for doc in resultado["documents"]
+    }
+    chunks_encontrados: set[str] = set()
+    docs_encontrados: set[str] = set()
     cantidad = 0
     chunks: set[str] = set()
     with metadata_path.open(encoding="utf-8") as archivo:
@@ -113,10 +141,31 @@ def validar_base(dir_encoder: Path) -> str:
             if chunk_id in chunks:
                 raise ValueError(f"metadata línea {numero}: chunk_id duplicado {chunk_id}")
             chunks.add(chunk_id)
+            docs_encontrados.add(registro["doc_id"])
+            if chunk_id in chunks_salida:
+                doc_salida, texto_salida = chunks_salida[chunk_id]
+                if doc_salida != registro["doc_id"]:
+                    raise ValueError(f"{chunk_id}: doc_id de salida no coincide con metadata")
+                if texto_salida not in registro["texto"]:
+                    raise ValueError(f"{chunk_id}: text no es un subfragmento trazable de metadata")
+                chunks_encontrados.add(chunk_id)
             cantidad += 1
     if indice.ntotal != cantidad:
         raise ValueError(f"index.ntotal={indice.ntotal}, metadata={cantidad}")
-    return f"{indice.ntotal} vectores, dimensión {indice.d}; metadata alineada y completa"
+    faltan_chunks = set(chunks_salida) - chunks_encontrados
+    faltan_docs = docs_salida - docs_encontrados
+    if faltan_chunks or faltan_docs:
+        raise ValueError(
+            f"salida no trazable: {len(faltan_chunks)} chunks y {len(faltan_docs)} documentos faltantes"
+        )
+    posiciones = np.linspace(0, indice.ntotal - 1, num=min(1000, indice.ntotal), dtype=int)
+    normas = np.linalg.norm(np.vstack([indice.reconstruct(int(i)) for i in posiciones]), axis=1)
+    if not np.allclose(normas, 1.0, atol=1e-3):
+        raise ValueError(f"vectores sin normalizar: normas {normas.min():.4f}–{normas.max():.4f}")
+    return (
+        f"{indice.ntotal} vectores, dimensión {indice.d}; metadata alineada, "
+        f"normas unitarias y {len(chunks_salida)} fragmentos de salida trazables"
+    )
 
 
 def validar_generador() -> str:
@@ -142,11 +191,11 @@ def validar_generador() -> str:
 
 def validar_pdf() -> str:
     path = ENTREGA / "informe_tecnico.pdf"
-    lector = PdfReader(str(path))
-    paginas = len(lector.pages)
+    with pdfplumber.open(path) as documento:
+        paginas = len(documento.pages)
+        texto = "\n".join(pagina.extract_text() or "" for pagina in documento.pages).lower()
     if paginas > 8:
         raise ValueError(f"tiene {paginas} páginas; máximo permitido: 8")
-    texto = "\n".join(pagina.extract_text() or "" for pagina in lector.pages).lower()
     for termino in ("chunking", "encoder", "faiss", "grafo"):
         if termino not in texto:
             raise ValueError(f"no aparece la sección requerida: {termino}")

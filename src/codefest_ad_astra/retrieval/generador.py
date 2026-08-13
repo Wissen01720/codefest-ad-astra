@@ -28,10 +28,11 @@ MAX_DOCUMENTOS = 3
 MAX_FRAGMENTOS = 10
 K_CHUNKS_POR_DEFECTO = 60  # suficientes candidatos para que los 3 docs top sumen >=10 chunks entre todos
 
-_FIN_ORACION_RE = re.compile(r"(?<=[.!?])\s+")
+_FIN_ORACION_RE = re.compile(r"[.!?…](?=[\]\)\}\"'»”’]*(?:\s|$))")
+_PRIMERA_LETRA_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
 
 
-def _truncar_a_oraciones_completas(texto: str, max_palabras: int) -> str:
+def _truncar_a_oraciones_completas(texto: str, max_palabras: int) -> str | None:
     """Recorta `texto` a lo sumo `max_palabras`, cortando siempre en un
     límite de oración completa — nunca a mitad de una oración.
 
@@ -40,25 +41,26 @@ def _truncar_a_oraciones_completas(texto: str, max_palabras: int) -> str:
     que se haya colado (p. ej. por la aproximación de conteo de tokens vs
     palabras en el fallback de chunking).
     """
-    palabras = texto.split()
-    if len(palabras) <= max_palabras:
-        return texto
-
-    oraciones = _FIN_ORACION_RE.split(texto)
-    acumuladas: list[str] = []
-    conteo = 0
-    for oracion in oraciones:
-        n = len(oracion.split())
-        if conteo + n > max_palabras:
+    ultimo_fin: int | None = None
+    for coincidencia in _FIN_ORACION_RE.finditer(texto):
+        candidato = texto[:coincidencia.end()].strip()
+        if len(candidato.split()) > max_palabras:
             break
-        acumuladas.append(oracion)
-        conteo += n
-
-    if not acumuladas:
-        # Ni la primera oración cabe sola (oración anómalamente larga):
-        # último recurso, corte duro por palabras.
-        return " ".join(palabras[:max_palabras])
-    return " ".join(acumuladas)
+        ultimo_fin = coincidencia.end()
+    if ultimo_fin is None:
+        return None
+    limpio = texto[:ultimo_fin].strip()
+    while True:
+        primera = _PRIMERA_LETRA_RE.search(limpio)
+        if primera is None or not primera.group().islower():
+            return limpio
+        fin_parcial = _FIN_ORACION_RE.search(limpio, primera.end())
+        if fin_parcial is None:
+            return limpio
+        restante = limpio[fin_parcial.end():].lstrip(" \t\r\n]})\"'»”’")
+        if not restante:
+            return limpio
+        limpio = restante
 
 
 def _cargar_consultas(path: Path) -> list[dict[str, str]]:
@@ -78,12 +80,21 @@ def generar_resultado(buscador: Buscador, query_id: str, pregunta: str) -> dict[
     # coincidencias en documentos con pocos chunks entre los primeros k.
     k = K_CHUNKS_POR_DEFECTO
     documentos: list[Any] = []
-    candidatos: list[Any] = []
+    candidatos: list[tuple[Any, str]] = []
     while True:
         resultados = buscador.buscar(pregunta, k=k)
         documentos = agregar_a_documentos(resultados, top_documentos=MAX_DOCUMENTOS)
-        candidatos = [c for doc in documentos for c in doc.chunks]
-        if len(candidatos) >= MAX_FRAGMENTOS or k >= buscador.indice.ntotal:
+        candidatos = []
+        for candidato in resultados:
+            texto = _truncar_a_oraciones_completas(
+                candidato.metadata["texto"], MAX_PALABRAS_FRAGMENTO
+            )
+            if texto is not None:
+                candidatos.append((candidato, texto))
+        if (
+            len(documentos) >= MAX_DOCUMENTOS
+            and len(candidatos) >= MAX_FRAGMENTOS
+        ) or k >= buscador.indice.ntotal:
             break
         k = min(k * 4, buscador.indice.ntotal)
 
@@ -91,17 +102,16 @@ def generar_resultado(buscador: Buscador, query_id: str, pregunta: str) -> dict[
         {"rank": i + 1, "doc_id": doc.doc_id} for i, doc in enumerate(documentos)
     ]
 
-    candidatos.sort(key=lambda c: c.score, reverse=True)
     top_fragmentos = candidatos[:MAX_FRAGMENTOS]
 
     fragments_out = [
         {
             "rank": i + 1,
-            "chunk_id": c.chunk_id,
-            "doc_id": c.metadata["doc_id"],
-            "text": _truncar_a_oraciones_completas(c.metadata["texto"], MAX_PALABRAS_FRAGMENTO),
+            "chunk_id": candidato.chunk_id,
+            "doc_id": candidato.metadata["doc_id"],
+            "text": texto,
         }
-        for i, c in enumerate(top_fragmentos)
+        for i, (candidato, texto) in enumerate(top_fragmentos)
     ]
 
     return {"query_id": query_id, "documents": documents_out, "fragments": fragments_out}
