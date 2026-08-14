@@ -167,16 +167,29 @@ def generar_resultados_jsonl(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genera resultados.jsonl (Fase 7).")
     parser.add_argument("--base", type=Path, required=True)
-    parser.add_argument("--consultas", type=Path, required=True)
-    parser.add_argument("--salida", type=Path, required=True)
+    parser.add_argument("--consultas", type=Path, help="Requerido salvo si se usa --pregunta.")
+    parser.add_argument("--salida", type=Path, help="Requerido salvo si se usa --pregunta.")
+    parser.add_argument(
+        "--pregunta", type=str, default=None,
+        help="Modo prueba: corre UNA consulta suelta (fuera de las 50 oficiales) e imprime "
+             "el resultado en consola, sin escribir en --salida ni tocar resultados.jsonl.",
+    )
     parser.add_argument("--device", type=str, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.pregunta is None and (args.consultas is None or args.salida is None):
+        parser.error("--consultas y --salida son requeridos salvo que uses --pregunta.")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        generar_resultados_jsonl(args.base, args.consultas, args.salida, device=args.device)
+        if args.pregunta is not None:
+            buscador = Buscador(args.base, device=args.device)
+            resultado = generar_resultado(buscador, "prueba", args.pregunta)
+            print(json.dumps(resultado, ensure_ascii=False, indent=2))
+        else:
+            generar_resultados_jsonl(args.base, args.consultas, args.salida, device=args.device)
     except SystemExit:
         raise
     except Exception as exc:

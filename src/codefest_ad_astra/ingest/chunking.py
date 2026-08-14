@@ -1201,19 +1201,16 @@ def build_chunks_for_document(
             sentence = sentences[cursor]
             if _is_oversize_sentence(sentence, texto, config, token_counter):
                 fragment_text = texto[sentence.char_start:sentence.char_end]
-                # Structured pair-aware splitting only makes sense for
-                # key/value-shaped formats; for everything else (pdf, json,
-                # txt...) go straight to the generic whitespace fallback so
-                # those formats aren't skip-document'd without even trying.
+                # La especificación prohíbe cortar oraciones de prosa. Los
+                # fallbacks internos solo son admisibles para representaciones
+                # tabulares/geográficas sin fronteras oracionales reales.
                 fmt = record.get("formato", "").lower()
-                tried_fallback = False
-                new_sentences = (
-                    _split_structured_pairs(sentence, texto, config, token_counter)
-                    if fmt in STRUCTURED_FORMATS
-                    else []
-                )
-                if not new_sentences:
-                    # fall back to whitespace-based splitting if no pairs found
+                new_sentences: list[Sentence] = []
+                if fmt in STRUCTURED_FORMATS:
+                    new_sentences = _split_structured_pairs(
+                        sentence, texto, config, token_counter
+                    )
+                if fmt in STRUCTURED_FORMATS and not new_sentences:
                     new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
                 if new_sentences and len(new_sentences) > 1:
                     (
@@ -1233,7 +1230,6 @@ def build_chunks_for_document(
                         texto,
                         token_counter,
                     )
-                    tried_fallback = True
                     continue
 
                 # if we reached here, fallback was not applicable or failed
@@ -1282,12 +1278,12 @@ def build_chunks_for_document(
                 if _is_oversize_sentence(sentence, texto, config, token_counter):
                     fragment_text = texto[sentence.char_start:sentence.char_end]
                     fmt = record.get("formato", "").lower()
-                    new_sentences = (
-                        _split_structured_pairs(sentence, texto, config, token_counter)
-                        if fmt in STRUCTURED_FORMATS
-                        else []
-                    )
-                    if not new_sentences:
+                    new_sentences: list[Sentence] = []
+                    if fmt in STRUCTURED_FORMATS:
+                        new_sentences = _split_structured_pairs(
+                            sentence, texto, config, token_counter
+                        )
+                    if fmt in STRUCTURED_FORMATS and not new_sentences:
                         new_sentences = _split_long_sentence_on_whitespace(sentence, texto, config, token_counter)
                     if new_sentences and len(new_sentences) > 1:
                         (
